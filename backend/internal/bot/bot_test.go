@@ -536,4 +536,47 @@ func TestHelpWhenModelSaysNothing(t *testing.T) {
 	}
 }
 
+// flakySender fails the first n sends with err.
+type flakySender struct {
+	fakeSender
+	n   int
+	err error
+}
+
+func (f *flakySender) SendMessage(ctx context.Context, chat int64, text string) error {
+	if f.n > 0 {
+		f.n--
+		return f.err
+	}
+	return f.fakeSender.SendMessage(ctx, chat, text)
+}
+
+func TestReplyIsRetriedOnTransientErrors(t *testing.T) {
+	old := replyBackoff
+	replyBackoff = []time.Duration{time.Millisecond, time.Millisecond}
+	defer func() { replyBackoff = old }()
+
+	e := newEnv(t, agent.RuleModel{})
+	flaky := &flakySender{n: 2, err: errors.New("telegram request Post: unexpected EOF")}
+	e.bot.sender = flaky
+	if err := e.bot.HandleUpdate(context.Background(), telegram.Update{UpdateID: 5, Message: &telegram.Message{
+		From: &telegram.User{ID: alice}, Chat: telegram.Chat{ID: alice, Type: "private"}, Text: "кофе 350"}}); err != nil {
+		t.Fatalf("reply lost after transient errors: %v", err)
+	}
+	if !strings.Contains(flaky.last(), "Записал") {
+		t.Fatalf("reply %q", flaky.last())
+	}
+
+	// A permanent Telegram error (e.g. the user blocked the bot) is not retried.
+	blocked := &flakySender{n: 5, err: &telegram.APIError{Method: "sendMessage", Code: 403, Description: "Forbidden"}}
+	e.bot.sender = blocked
+	if err := e.bot.HandleUpdate(context.Background(), telegram.Update{UpdateID: 6, Message: &telegram.Message{
+		From: &telegram.User{ID: alice}, Chat: telegram.Chat{ID: alice, Type: "private"}, Text: "кофе 100"}}); err == nil {
+		t.Fatal("expected an error")
+	}
+	if blocked.n != 4 {
+		t.Fatalf("403 was retried: %d attempts left", blocked.n)
+	}
+}
+
 func ptr[T any](v T) *T { return &v }

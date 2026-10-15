@@ -39,7 +39,10 @@ type LLM struct {
 	APIKey   string
 	Model    string
 	BaseURL  string
-	Timeout  time.Duration
+	// WorkspaceID is sent as anthropic-workspace-id; needed only for
+	// Anthropic API keys that are not scoped to a workspace.
+	WorkspaceID string
+	Timeout     time.Duration
 }
 
 // Bot settings.
@@ -204,6 +207,8 @@ func loadLLM(e *errs) LLM {
 		APIKey:   env("LLM_API_KEY", ""),
 		Model:    env("LLM_MODEL", ""),
 		BaseURL:  strings.TrimRight(env("LLM_BASE_URL", ""), "/"),
+
+		WorkspaceID: env("LLM_WORKSPACE_ID", ""),
 	}
 	timeout, err := time.ParseDuration(env("LLM_TIMEOUT", "30s"))
 	if err != nil || timeout <= 0 || timeout > 5*time.Minute {

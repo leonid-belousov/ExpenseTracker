@@ -5,3 +5,4 @@ backend/expense-tracker.exe
 coverage.out
 frontend/node_modules/
 frontend/dist/
+docker-compose.override.yml

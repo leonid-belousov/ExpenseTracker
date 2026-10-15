@@ -190,13 +190,36 @@ func (b *Bot) compose(res agent.Result) string {
 	return strings.Join(parts, "\n\n")
 }
 
+// replyBackoff is the pause before each retry of a failed reply.
+var replyBackoff = []time.Duration{time.Second, 3 * time.Second}
+
+// reply sends a message, retrying transient failures: the reply is sent after
+// the transaction committed, so a dropped connection would otherwise lose the
+// answer to a change that was saved (seen live: a timeout followed by EOF).
+// Telegram's 4xx answers other than 429 are permanent and not retried. A
+// timed-out attempt may still have been delivered, so a retry can rarely
+// duplicate a message; that is better than losing it.
 func (b *Bot) reply(ctx context.Context, chatID int64, text string) error {
-	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-	defer cancel()
-	if err := b.sender.SendMessage(sctx, chatID, text); err != nil {
-		return fmt.Errorf("send reply: %w", err)
+	ctx = context.WithoutCancel(ctx)
+	var err error
+	for attempt := 0; ; attempt++ {
+		sctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		err = b.sender.SendMessage(sctx, chatID, text)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		var apiErr *telegram.APIError
+		if errors.As(err, &apiErr) && apiErr.Code >= 400 && apiErr.Code < 500 && apiErr.Code != 429 {
+			break
+		}
+		if attempt >= len(replyBackoff) {
+			break
+		}
+		b.log.Warn("reply failed, retrying", "attempt", attempt+1, "error", err.Error())
+		time.Sleep(replyBackoff[attempt])
 	}
-	return nil
+	return fmt.Errorf("send reply: %w", err)
 }
 
 // Poller runs the long-polling loop.

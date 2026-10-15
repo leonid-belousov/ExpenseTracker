@@ -226,7 +226,7 @@ Every setting is documented in [`.env.example`](.env.example). Nothing is requir
 | `LLM_PROVIDER` | bot | `anthropic`, `openai` or `mock`. Required once the token is set. |
 | `LLM_API_KEY` | bot | Required for `anthropic` / `openai` |
 
-Optional: `APP_TIMEZONE` (default `Europe/Moscow`), `CURRENCY` (`RUB`), `BOT_LANGUAGE` (`ru`/`en`, the default reply language and the language of fixed texts), `LLM_MODEL`, `LLM_BASE_URL`, `LLM_TIMEOUT` (`30s`, per model call), `AGENT_MAX_STEPS` (`6`), `WEB_PORT` (`8080`), `API_PORT` (`8081`), `CORS_ALLOWED_ORIGINS`, `LOG_LEVEL`.
+Optional: `LLM_WORKSPACE_ID` (Anthropic keys not scoped to a workspace), `APP_TIMEZONE` (default `Europe/Moscow`), `CURRENCY` (`RUB`), `BOT_LANGUAGE` (`ru`/`en`, the default reply language and the language of fixed texts), `LLM_MODEL`, `LLM_BASE_URL`, `LLM_TIMEOUT` (`30s`, per model call), `AGENT_MAX_STEPS` (`6`), `WEB_PORT` (`8080`), `API_PORT` (`8081`), `CORS_ALLOWED_ORIGINS`, `LOG_LEVEL`.
 
 ### Telegram bot setup
 
@@ -234,11 +234,20 @@ Optional: `APP_TIMEZONE` (default `Europe/Moscow`), `CURRENCY` (`RUB`), `BOT_LAN
 2. Find each family member's numeric Telegram id. Either use @userinfobot, or start the stack and message the bot: non-members get a reply with their own id.
 3. List the members in `FAMILY_MEMBERS` and restart: `docker compose up -d bot api`.
 
+If the bot logs `cannot reach Telegram: ... dial tcp 127.0.0.1:443`, the host's DNS maps `api.telegram.org` to a local unblocking tool, which containers can't reach. Pin the Bot API address for the bot in a git-ignored `docker-compose.override.yml`:
+
+```yaml
+services:
+  bot:
+    extra_hosts:
+      - "api.telegram.org:149.154.167.220"
+```
+
 The bot uses long polling, so it needs no public URL or webhook. If a webhook is set for this token, Telegram answers `409` and the bot logs it. Remove the webhook with `https://api.telegram.org/bot<token>/deleteWebhook`. Run only one bot instance per token.
 
 ### LLM provider setup
 
-- **Anthropic (Claude):** `LLM_PROVIDER=anthropic`, `LLM_API_KEY=sk-ant-...`. `LLM_MODEL` defaults to `claude-opus-5-5`; `claude-sonnet-5-5` or `claude-haiku-5-5` are cheaper options — compare them with the [eval](#agent-eval) before switching. The bot uses the official Go SDK with strict client tools, low effort, and a cached tools + system prompt prefix.
+- **Anthropic (Claude):** `LLM_PROVIDER=anthropic`, `LLM_API_KEY=sk-ant-...`. `LLM_MODEL` defaults to `claude-opus-5-5`; `claude-sonnet-5-5` scored the same on the [eval](#agent-eval) at about 60% of the cost, and `claude-haiku-5-5` is far cheaper but made two mistakes. The bot uses the official Go SDK with strict client tools, low effort, and a cached tools + system prompt prefix. If the API answers that the key "is not scoped to a workspace", set `LLM_WORKSPACE_ID` (Console → Settings → Workspaces) or create a key inside a workspace.
 - **OpenAI-compatible:** `LLM_PROVIDER=openai`, `LLM_BASE_URL` (default `https://api.openai.com/v1`), `LLM_MODEL`, `LLM_API_KEY`. Works with OpenAI, OpenRouter, vLLM, or Ollama (`http://host.docker.internal:11434/v1`, any non-empty key) — the model must support function calling. Tools are sent with `strict: true`.
 - **Mock (development only):** `LLM_PROVIDER=mock`. A deterministic rule-based model (`agent.RuleModel`) that drives the same tools for roughly the brief's examples, with no network. It logs a warning at startup. **Do not use it for real families:** it misreads anything outside those patterns (it scores about 61% on the eval).
 
@@ -312,7 +321,23 @@ LLM_PROVIDER=anthropic LLM_API_KEY=sk-ant-... LLM_MODEL=claude-haiku-5-5 go run 
 
 It prints every failing case with the replies, a pass-rate table per tag, latency p50/p95 per message, model calls and tokens per message, cache-read share, and the cost (built-in prices for current Claude models, or `-price-in` / `-price-out`). The exit code is non-zero if any case fails. `-runs N` repeats cases because models are not deterministic.
 
-Baseline of the offline rule-based model: **31 / 51 (61%)**, `brief` 6/6, no security failures; it fails on everything outside the example phrasings (weekdays, "2,5 тыс", follow-ups, injections it can't parse). A Go test keeps the mock at 100% on the `brief` cases, so the whole eval pipeline is exercised in `go test ./...` without a network. Measuring a real model costs money — roughly 60 messages × ~2 model calls each; on `claude-opus-5-5` that is about a dollar or two per run, on `claude-haiku-5-5` a few cents.
+Every case also checks the reply style the system prompt asks for: no memory notes (`[ids: …]`) and no machine-formatted amounts (`1450.00`).
+
+**Results** (2026-10-16, one run each, 56 messages):
+
+| Model | Passed | Latency p50 / p95 | Model calls / message | Input tokens / message (cache reads) | Cost per 1000 messages |
+|---|---|---|---|---|---|
+| `claude-opus-5-5` (default) | **51 / 51** | 4.0 s / 6.9 s | 1.96 | 7 557 (87%) | $8.53 |
+| `claude-sonnet-5-5` | **51 / 51** | 3.2 s / 7.2 s | 2.05 | 7 961 (87%) | $5.28 |
+| `claude-haiku-5-5` | 49 / 51 | 4.0 s / 7.2 s | 2.14 | 8 376 (86%) | $0.31 |
+| offline `mock` | 31 / 51 | — | — | — | free |
+
+Haiku's two failures were a future-dated expense silently recorded on another date and a weekly list that included the previous week. The mock fails on everything outside the example phrasings (weekdays, "2,5 тыс", follow-ups, injections it can't parse); a Go test keeps it at 100% on the `brief` cases, so the whole eval pipeline runs in `go test ./...` without a network. Single runs are noisy: use `-runs 3` before choosing a model.
+
+What the eval caught while building the agent, and how it was fixed:
+
+- **Every request failed with HTTP 400** on the real API: strict tool use allows at most 16 union-typed (nullable) parameters across all tools, and the first schema had 17. Optional enums now use explicit values (`"any"`, `"unchanged"`, `"none"`), and `TestToolSchemaUnionBudget` keeps the count at 12 or below.
+- **Style problems that the state checks don't see**, found by reading the replies: "1450.00 RUB" next to "1 450 ₽", switching between «ты» and «вы» and between «записал» and «записала», a reply that repeated the receipt, the model's memory note `[ids: 3, 2]` copied into a reply, a reply made of a zero-width space, and an English note-to-self ("Future dates are rejected. Ask the user.") before the Russian answer. Fixed with a clearer "Replying" section in the system prompt, `agent.CleanReply` (drops notes, invisible characters, and leading non-Cyrillic paragraphs in Russian replies), and the style checks above.
 
 To add a case, append it to `cases.json` (the loader rejects unknown fields and invalid amounts/dates). Every bug found in real use should become a case.
 

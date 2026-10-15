@@ -99,6 +99,9 @@ func TestOpenAICompatibleErrors(t *testing.T) {
 func TestAnthropicToolLoop(t *testing.T) {
 	var bodies []map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("anthropic-workspace-id") != "wrkspc_test" {
+			t.Errorf("workspace header %q", r.Header.Get("anthropic-workspace-id"))
+		}
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		bodies = append(bodies, body)
@@ -114,7 +117,7 @@ func TestAnthropicToolLoop(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := NewAnthropic("k", "claude-opus-5-5", srv.URL, time.Second).Start(testRequest())
+	s := NewAnthropic("k", "claude-opus-5-5", srv.URL, "wrkspc_test", time.Second).Start(testRequest())
 	turn, err := s.Next(context.Background(), nil)
 	if err != nil || len(turn.Calls) != 1 || turn.Calls[0].ID != "tu_1" || turn.Usage.InputTokens != 150 || turn.Usage.CacheReadTokens != 50 {
 		t.Fatalf("turn %+v %v", turn, err)
@@ -164,7 +167,7 @@ func TestAnthropicRefusalAndStatus(t *testing.T) {
 			w.WriteHeader(c.status)
 			_, _ = io.WriteString(w, c.body)
 		}))
-		_, err := NewAnthropic("k", "m", srv.URL, time.Second).Start(testRequest()).Next(context.Background(), nil)
+		_, err := NewAnthropic("k", "m", srv.URL, "", time.Second).Start(testRequest()).Next(context.Background(), nil)
 		srv.Close()
 		if !errors.Is(err, ErrUnavailable) {
 			t.Errorf("%s: err %v", name, err)

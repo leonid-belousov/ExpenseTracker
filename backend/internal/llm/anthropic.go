@@ -25,9 +25,10 @@ var fallbackModels = map[string]bool{
 	"claude-fable-5-1": true, "claude-opus-5-5": true, "claude-opus-5": true, "claude-sonnet-5-5": true,
 }
 
-// NewAnthropic builds a Claude backend. baseURL may be empty. timeout bounds
+// NewAnthropic builds a Claude backend. baseURL may be empty. workspaceID is
+// needed only for API keys that are not scoped to a workspace. timeout bounds
 // one model call.
-func NewAnthropic(apiKey, model, baseURL string, timeout time.Duration) *Anthropic {
+func NewAnthropic(apiKey, model, baseURL, workspaceID string, timeout time.Duration) *Anthropic {
 	opts := []option.RequestOption{
 		option.WithAPIKey(apiKey),
 		option.WithRequestTimeout(timeout),
@@ -35,6 +36,9 @@ func NewAnthropic(apiKey, model, baseURL string, timeout time.Duration) *Anthrop
 	}
 	if baseURL != "" {
 		opts = append(opts, option.WithBaseURL(baseURL))
+	}
+	if workspaceID != "" {
+		opts = append(opts, option.WithHeader("anthropic-workspace-id", workspaceID))
 	}
 	a := &Anthropic{client: anthropic.NewClient(opts...), model: model}
 	if baseURL == "" && fallbackModels[model] {

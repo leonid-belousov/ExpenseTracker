@@ -72,9 +72,9 @@ const dateDesc = `"today", "yesterday", "day_before_yesterday" or "YYYY-MM-DD"`
 
 func periodProps(defaultDesc string) map[string]any {
 	return map[string]any{
-		"preset": nullable(enum("Relative period; weeks start on Monday. "+defaultDesc, presetNames())),
-		"from":   nullable(str("Inclusive start date, " + dateDesc + ". Use instead of preset for explicit dates.")),
-		"to":     nullable(str("Inclusive end date, " + dateDesc + ".")),
+		"preset": enum(`Relative period; weeks start on Monday. "none": use from/to instead. `+defaultDesc, append([]string{"none"}, presetNames()...)),
+		"from":   nullable(str("Inclusive start date, " + dateDesc + `. Only with preset "none".`)),
+		"to":     nullable(str("Inclusive end date, " + dateDesc + `. Only with preset "none".`)),
 	}
 }
 
@@ -90,8 +90,13 @@ func merge(ms ...map[string]any) map[string]any {
 
 // Tools returns the tool definitions. They never take an owner: the
 // application always applies them to the sender's own expenses.
+//
+// Claude's strict tool use allows at most 16 union-typed (nullable)
+// parameters across all tools, so optional enums use an explicit value
+// ("any", "unchanged", "none") instead of null; see TestToolSchemaUnionBudget.
 func Tools() []llm.ToolSpec {
 	cat := enum("Expense category.", categoryNames())
+	catFilter := enum(`Category filter; "any" means all categories.`, append([]string{"any"}, categoryNames()...))
 	return []llm.ToolSpec{
 		{
 			Name: ToolAddExpenses,
@@ -101,7 +106,7 @@ func Tools() []llm.ToolSpec {
 				"items": map[string]any{"type": "array", "items": object(map[string]any{
 					"amount":   str(`Amount as written by the user, decimal, e.g. "350" or "99.90". Must be > 0 with at most 2 decimals.`),
 					"category": cat,
-					"date":     nullable(str("Date of the expense, " + dateDesc + "; null means today. Future dates are rejected.")),
+					"date":     str("Date of the expense, " + dateDesc + `; "today" unless the user says otherwise. Future dates are rejected.`),
 					"comment":  nullable(str(`Short description in the user's words, e.g. "кофе", "такси". No amount or date in it.`)),
 				})},
 			}),
@@ -111,28 +116,28 @@ func Tools() []llm.ToolSpec {
 			Description: "Find the user's expenses. All given filters are combined with AND. " +
 				"Returns matching expenses with ids, plus the total count and exact sum of all matches. " +
 				"Use it to list expenses and to locate an expense before changing or deleting it.",
-			Schema: object(merge(periodProps("If preset, from and to are all null, all time is searched."), map[string]any{
-				"category": nullable(cat),
+			Schema: object(merge(periodProps(`With "none" and no dates, all time is searched.`), map[string]any{
+				"category": catFilter,
 				"amount":   nullable(str(`Exact amount, e.g. "350".`)),
 				"text":     nullable(str(`Case-insensitive substring of the comment. Prefer a word stem ("такс" matches "такси", "Такси до работы").`)),
 				"sort":     enum(`"recently_added": newest recorded first ("the last one" = recently_added with limit 1); "by_date": newest expense date first.`, []string{"recently_added", "by_date"}),
-				"limit":    nullable(map[string]any{"type": "integer", "description": "Maximum expenses to return, 1-20; null means 10."}),
+				"limit":    map[string]any{"type": "integer", "description": "Maximum expenses to return, 1-20 (10 is a good default)."},
 			})),
 		},
 		{
 			Name:        ToolSummarizeExpenses,
 			Description: "Total amount and count of the user's expenses for a period, optionally for one category, with a per-category breakdown.",
-			Schema: object(merge(periodProps("If preset, from and to are all null, the current month is used."), map[string]any{
-				"category": nullable(cat),
+			Schema: object(merge(periodProps(`With "none" and no dates, the current month is used.`), map[string]any{
+				"category": catFilter,
 			})),
 		},
 		{
 			Name:        ToolUpdateExpense,
-			Description: "Change fields of one of the user's expenses. Only pass the new values; null keeps a field unchanged. The id must come from a tool result.",
+			Description: "Change fields of one of the user's expenses. Only pass the new values; null (or \"unchanged\" for category) keeps a field. The id must come from a tool result.",
 			Schema: object(map[string]any{
 				"id":       map[string]any{"type": "integer", "description": "Expense id from a tool result."},
 				"amount":   nullable(str(`New amount, e.g. "450".`)),
-				"category": nullable(cat),
+				"category": enum(`New category, or "unchanged".`, append([]string{"unchanged"}, categoryNames()...)),
 				"date":     nullable(str("New date, " + dateDesc + ".")),
 				"comment":  nullable(str("New comment.")),
 			}),
@@ -287,8 +292,14 @@ func parseAmount(field string, s *string) (*money.Amount, error) {
 	return &a, nil
 }
 
+// parseCategory returns nil for an absent value, including the schema's
+// explicit "any" (filters) and "unchanged" (updates).
 func parseCategory(field string, s *string) (*expense.Category, error) {
-	if s == nil || strings.TrimSpace(*s) == "" {
+	if s == nil {
+		return nil, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(*s)) {
+	case "", "any", "unchanged":
 		return nil, nil
 	}
 	c, err := expense.ParseCategory(*s)
@@ -308,7 +319,7 @@ type periodArgs struct {
 // (nil def means all time).
 func (p periodArgs) resolve(today dates.Date, def *dates.Preset) (dates.Range, error) {
 	allTime := dates.Range{From: expense.MinSpentAt, To: today.AddDays(1)}
-	if p.Preset != nil && strings.TrimSpace(*p.Preset) != "" {
+	if p.Preset != nil && strings.TrimSpace(*p.Preset) != "" && strings.ToLower(strings.TrimSpace(*p.Preset)) != "none" {
 		name := strings.ToLower(strings.TrimSpace(*p.Preset))
 		if name == "all_time" {
 			return allTime, nil
@@ -464,8 +475,8 @@ func (tb *toolbox) find(ctx context.Context, raw json.RawMessage) (any, error) {
 	if in.Sort == "recently_added" {
 		f.Order = expense.OrderCreatedDesc
 	}
-	if in.Limit != nil {
-		f.Limit = min(max(*in.Limit, 1), maxFindLimit)
+	if in.Limit != nil && *in.Limit > 0 {
+		f.Limit = min(*in.Limit, maxFindLimit)
 	}
 	if f.Category, err = parseCategory("category", in.Category); err != nil {
 		return nil, err
@@ -586,12 +597,25 @@ func (tb *toolbox) update(ctx context.Context, raw json.RawMessage) (any, error)
 	if !changed {
 		return nil, badInput("", "no new values given")
 	}
+	// A repeated or redundant call (seen live: the model updated 600 -> 650
+	// and then 650 -> 650) must not change updated_at or add a receipt line.
+	if f.Amount == before.Amount && f.Category == before.Category && f.SpentAt.Equal(before.SpentAt) &&
+		sameComment(expense.NormalizeComment(f.Comment), before.Comment) {
+		return nil, badInput("", "the expense already has these values; nothing was changed")
+	}
 	after, err := tb.svc.Update(ctx, tb.scope(), in.ID, f)
 	if err != nil {
 		return nil, validation(err)
 	}
 	tb.changes = append(tb.changes, Change{Kind: Updated, Before: before, After: after})
 	return map[string]any{"before": view(before), "after": view(after), "currency": tb.currency}, nil
+}
+
+func sameComment(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 func (tb *toolbox) delete(ctx context.Context, raw json.RawMessage) (any, error) {

@@ -10,7 +10,7 @@ import (
 func NewModel(c config.LLM) llm.Model {
 	switch c.Provider {
 	case "anthropic":
-		return llm.NewAnthropic(c.APIKey, c.Model, c.BaseURL, c.Timeout)
+		return llm.NewAnthropic(c.APIKey, c.Model, c.BaseURL, c.WorkspaceID, c.Timeout)
 	case "openai":
 		return llm.NewOpenAICompatible(c.BaseURL, c.APIKey, c.Model, c.Timeout)
 	}

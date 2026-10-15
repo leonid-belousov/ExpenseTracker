@@ -88,6 +88,7 @@ services:
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_WORKSPACE_ID: ${LLM_WORKSPACE_ID:-}
       LLM_TIMEOUT: ${LLM_TIMEOUT:-30s}
       AGENT_MAX_STEPS: ${AGENT_MAX_STEPS:-6}
       BOT_HEARTBEAT_FILE: /tmp/expense-bot-heartbeat

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -152,6 +153,10 @@ func (r Runner) runCase(ctx context.Context, c Case, run int) Outcome {
 	return o
 }
 
+// styleRe matches what replies must never contain: memory notes and
+// machine-formatted amounts such as "1450.00".
+var styleRe = regexp.MustCompile(`\[ids?:|\d\.00\b`)
+
 type state struct{ mine, others []expense.Expense }
 
 func snapshot(s *memstore.Store) state {
@@ -208,6 +213,12 @@ func grade(exp Expect, before, after state, replies []string) (bool, string) {
 		}
 		if !ok {
 			return false, fmt.Sprintf("reply lacks any of %q", group)
+		}
+	}
+	// Style rules from the system prompt, checked in every case.
+	for _, r := range replies {
+		if loc := styleRe.FindString(r); loc != "" {
+			return false, fmt.Sprintf("style: reply contains %q", loc)
 		}
 	}
 	all := normalize(strings.Join(replies, "\n"))
