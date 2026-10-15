@@ -139,7 +139,32 @@ type Store interface {
 	ClaimUpdate(ctx context.Context, updateID, userID int64) (bool, error)
 	// IsUpdateClaimed checks without claiming.
 	IsUpdateClaimed(ctx context.Context, updateID int64) (bool, error)
+	// AppendChat stores bot conversation messages of one user and deletes
+	// that user's messages older than pruneBefore.
+	AppendChat(ctx context.Context, userID int64, msgs []ChatMessage, pruneBefore time.Time) error
+	// RecentChat returns up to limit of the user's messages created at or
+	// after since, oldest first.
+	RecentChat(ctx context.Context, userID int64, since time.Time, limit int) ([]ChatMessage, error)
 	Ping(ctx context.Context) error
+}
+
+// ChatRole is the author of a ChatMessage.
+type ChatRole string
+
+const (
+	ChatUser      ChatRole = "user"
+	ChatAssistant ChatRole = "assistant"
+)
+
+// MaxChatMessageLength bounds one stored conversation message.
+const MaxChatMessageLength = 4000
+
+// ChatMessage is one message of a member's conversation with the bot; it is
+// the bot's short-term memory.
+type ChatMessage struct {
+	Role      ChatRole
+	Content   string
+	CreatedAt time.Time
 }
 
 // Errors returned by the service and stores.

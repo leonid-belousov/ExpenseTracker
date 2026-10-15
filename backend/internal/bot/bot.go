@@ -1,15 +1,18 @@
-// Package bot handles Telegram updates: it authorises the sender, asks the
-// LLM parser for an intent, and executes that intent through the expense
-// service strictly within the sender's own scope.
+// Package bot handles Telegram updates: it authorises the sender, loads the
+// short conversation memory, and runs the AI agent for the message inside one
+// database transaction scoped to the sender.
 //
 // Security model:
 //   - The actor is taken only from the Telegram update (message.from.id).
-//   - Only configured family members are served, and only in private chats.
-//   - Every read and write uses expense.OwnerScope(actor); the parser output
-//     has no field that can name another owner.
-//   - Update ids are claimed in the same transaction as the operation, so a
-//     redelivered update never applies twice.
-//   - The reply is sent only after the transaction commits.
+//   - Only configured family members are served, and only in private chats;
+//     the LLM is never called for anyone else.
+//   - The agent's tools act only on expense.OwnerScope(actor); no tool
+//     argument can name another owner.
+//   - The update id is claimed in the same transaction as the agent's
+//     changes and the memory write, so a redelivered update never applies
+//     twice and a failed turn leaves nothing behind.
+//   - The reply is sent only after the transaction commits, and its receipt
+//     of changes comes from what the tools actually did.
 package bot
 
 import (
@@ -21,7 +24,7 @@ import (
 	"strings"
 	"time"
 
-	"expensetracker/internal/dates"
+	"expensetracker/internal/agent"
 	"expensetracker/internal/expense"
 	"expensetracker/internal/llm"
 	"expensetracker/internal/telegram"
@@ -29,15 +32,31 @@ import (
 
 // Config holds bot settings.
 type Config struct {
-	Currency   string
-	Language   string
-	LLMTimeout time.Duration
+	Currency string
+	Language string
+	// Conversation memory: messages newer than MemoryWindow, at most
+	// MemoryMessages of them and MemoryChars characters, are given to the
+	// agent. Stored messages are deleted after MemoryRetention.
+	MemoryWindow    time.Duration
+	MemoryMessages  int
+	MemoryChars     int
+	MemoryRetention time.Duration
+	// OnTurn, if set, is called after every agent turn (for evals/metrics).
+	OnTurn func(TurnInfo)
+}
+
+// TurnInfo describes one processed message.
+type TurnInfo struct {
+	UpdateID int64
+	Stats    agent.Stats
+	Duration time.Duration
+	Err      error
 }
 
 // Bot processes updates.
 type Bot struct {
 	svc    *expense.Service
-	parser llm.Parser
+	agent  *agent.Agent
 	sender telegram.Sender
 	msgs   Messages
 	cfg    Config
@@ -45,11 +64,20 @@ type Bot struct {
 }
 
 // New builds a bot.
-func New(svc *expense.Service, parser llm.Parser, sender telegram.Sender, cfg Config, log *slog.Logger) *Bot {
-	if cfg.LLMTimeout <= 0 {
-		cfg.LLMTimeout = 30 * time.Second
+func New(svc *expense.Service, ag *agent.Agent, sender telegram.Sender, cfg Config, log *slog.Logger) *Bot {
+	if cfg.MemoryWindow <= 0 {
+		cfg.MemoryWindow = 6 * time.Hour
 	}
-	return &Bot{svc: svc, parser: parser, sender: sender, msgs: Catalog(cfg.Language), cfg: cfg, log: log}
+	if cfg.MemoryMessages <= 0 {
+		cfg.MemoryMessages = 12
+	}
+	if cfg.MemoryChars <= 0 {
+		cfg.MemoryChars = 6000
+	}
+	if cfg.MemoryRetention <= 0 {
+		cfg.MemoryRetention = 7 * 24 * time.Hour
+	}
+	return &Bot{svc: svc, agent: ag, sender: sender, msgs: Catalog(cfg.Language), cfg: cfg, log: log}
 }
 
 var errDuplicate = errors.New("update already processed")
@@ -87,25 +115,19 @@ func (b *Bot) HandleUpdate(ctx context.Context, u telegram.Update) error {
 		return nil
 	}
 
-	pctx, cancel := context.WithTimeout(ctx, b.cfg.LLMTimeout)
-	intent, err := b.parser.Parse(pctx, llm.Request{
-		Text: text, Today: b.svc.Today(), TimeZone: b.svc.Location().String(), Language: b.cfg.Language,
-	})
-	cancel()
+	now := b.svc.Now()
+	recent, err := b.svc.RecentChat(ctx, actor, now.Add(-b.cfg.MemoryWindow), b.cfg.MemoryMessages)
 	if err != nil {
-		var fe *llm.FieldError
-		switch {
-		case errors.As(err, &fe):
-			return b.reply(ctx, msg.Chat.ID, b.fieldMessage(fe.Field))
-		case errors.Is(err, llm.ErrMalformed):
-			b.log.Warn("llm returned malformed intent", "update_id", u.UpdateID)
-			return b.reply(ctx, msg.Chat.ID, b.msgs.LLMMalformed)
-		default:
-			b.log.Warn("llm unavailable", "update_id", u.UpdateID, "error", err.Error())
-			return b.reply(ctx, msg.Chat.ID, b.msgs.LLMUnavailable)
-		}
+		b.log.Error("loading conversation failed", "update_id", u.UpdateID, "error", err.Error())
+		return b.reply(ctx, msg.Chat.ID, b.msgs.StorageFailed)
 	}
+	history, knownIDs := agent.History(recent, b.cfg.MemoryChars)
 
+	// The whole agent turn runs in one transaction: model calls happen while
+	// it is open, which is fine for a family-sized bot that handles updates
+	// one at a time, and it means a failure at any step saves nothing.
+	start := time.Now()
+	var res agent.Result
 	var reply string
 	err = b.svc.InTx(ctx, func(tx *expense.Service) error {
 		claimed, err := tx.ClaimUpdate(ctx, u.UpdateID, actor)
@@ -115,19 +137,57 @@ func (b *Bot) HandleUpdate(ctx context.Context, u telegram.Update) error {
 		if !claimed {
 			return errDuplicate
 		}
-		reply, err = b.execute(ctx, tx, actor, intent)
-		return err
+		res, err = b.agent.Run(ctx, tx, actor, history, knownIDs, text)
+		if err != nil {
+			return err
+		}
+		reply = b.compose(res)
+		return tx.AppendChat(ctx, actor, []expense.ChatMessage{
+			{Role: expense.ChatUser, Content: text},
+			{Role: expense.ChatAssistant, Content: reply + agent.RefsNote(res.Refs)},
+		}, now.Add(-b.cfg.MemoryRetention))
 	})
+	if b.cfg.OnTurn != nil && !errors.Is(err, errDuplicate) {
+		b.cfg.OnTurn(TurnInfo{UpdateID: u.UpdateID, Stats: res.Stats, Duration: time.Since(start), Err: err})
+	}
+	logAttrs := []any{"update_id", u.UpdateID, "steps", res.Stats.Steps, "tools", strings.Join(res.Stats.ToolCalls, ","),
+		"tool_errors", res.Stats.ToolErrors, "input_tokens", res.Stats.Usage.InputTokens, "output_tokens", res.Stats.Usage.OutputTokens,
+		"duration_ms", time.Since(start).Milliseconds()}
 	switch {
 	case errors.Is(err, errDuplicate):
 		b.log.Info("skipping duplicate update", "update_id", u.UpdateID)
 		return nil
+	case errors.Is(err, llm.ErrMalformed):
+		b.log.Warn("llm returned an unusable answer", append(logAttrs, "error", err.Error())...)
+		return b.reply(ctx, msg.Chat.ID, b.msgs.LLMMalformed)
+	case errors.Is(err, llm.ErrUnavailable) || errors.Is(err, context.DeadlineExceeded):
+		b.log.Warn("llm unavailable", append(logAttrs, "error", err.Error())...)
+		return b.reply(ctx, msg.Chat.ID, b.msgs.LLMUnavailable)
+	case errors.Is(err, agent.ErrStepLimit):
+		b.log.Warn("agent step limit reached", logAttrs...)
+		return b.reply(ctx, msg.Chat.ID, b.msgs.StepLimit)
 	case err != nil:
-		b.log.Error("operation failed", "update_id", u.UpdateID, "action", string(intent.Action), "error", err.Error())
+		b.log.Error("operation failed", append(logAttrs, "error", err.Error())...)
 		return b.reply(ctx, msg.Chat.ID, b.msgs.StorageFailed)
 	}
-	b.log.Info("update processed", "update_id", u.UpdateID, "action", string(intent.Action))
+	b.log.Info("update processed", append(logAttrs, "changes", len(res.Changes))...)
 	return b.reply(ctx, msg.Chat.ID, reply)
+}
+
+// compose builds the reply: the agent's text followed by the receipt of
+// changes. With neither, the help text is shown.
+func (b *Bot) compose(res agent.Result) string {
+	var parts []string
+	if res.Text != "" {
+		parts = append(parts, res.Text)
+	}
+	if lines := b.msgs.receipt(res.Changes, b.cfg.Currency); len(lines) > 0 {
+		parts = append(parts, strings.Join(lines, "\n"))
+	}
+	if len(parts) == 0 {
+		return b.msgs.Help
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 func (b *Bot) reply(ctx context.Context, chatID int64, text string) error {
@@ -137,207 +197,6 @@ func (b *Bot) reply(ctx context.Context, chatID int64, text string) error {
 		return fmt.Errorf("send reply: %w", err)
 	}
 	return nil
-}
-
-func (b *Bot) fieldMessage(field string) string {
-	switch {
-	case strings.HasSuffix(field, "amount"):
-		return b.msgs.InvalidAmount
-	case strings.HasSuffix(field, "date") || field == "spent_at" || strings.HasPrefix(field, "period."):
-		return b.msgs.InvalidDate
-	case field == "period":
-		return b.msgs.InvalidPeriod
-	case field == "comment":
-		return b.msgs.InvalidComment
-	}
-	return b.msgs.Default
-}
-
-// validationReply converts a service validation error into a reply; other
-// errors are returned for the caller to roll back.
-func (b *Bot) validationReply(err error) (string, error) {
-	var ve *expense.ValidationError
-	if errors.As(err, &ve) {
-		for _, f := range []string{"amount", "spent_at", "comment", "category"} {
-			if _, ok := ve.Fields[f]; ok {
-				if f == "category" {
-					return fmt.Sprintf(b.msgs.AskCategory, b.msgs.categoryList()), nil
-				}
-				return b.fieldMessage(f), nil
-			}
-		}
-		return b.msgs.Default, nil
-	}
-	return "", err
-}
-
-// execute runs the intent inside the transaction-bound service. All access is
-// scoped to actor.
-func (b *Bot) execute(ctx context.Context, svc *expense.Service, actor int64, in llm.Intent) (string, error) {
-	scope := expense.OwnerScope(actor)
-	switch in.Action {
-	case llm.ActionCreate:
-		if in.Amount == nil {
-			return b.msgs.AskAmount, nil
-		}
-		if in.Category == nil {
-			return fmt.Sprintf(b.msgs.AskCategory, b.msgs.categoryList()), nil
-		}
-		day := svc.Today()
-		if in.Date != nil {
-			day = *in.Date
-		}
-		e, err := svc.Create(ctx, scope, expense.Fields{UserID: actor, Amount: *in.Amount, Category: *in.Category, SpentAt: day, Comment: in.Comment})
-		if err != nil {
-			return b.validationReply(err)
-		}
-		return fmt.Sprintf(b.msgs.Created, b.msgs.expenseLine(e, b.cfg.Currency)), nil
-
-	case llm.ActionList, llm.ActionSummary:
-		period := in.Period
-		if period == nil {
-			r, _ := dates.ThisMonth.Resolve(svc.Today())
-			period = &r
-		}
-		const shown = 20
-		f := expense.Filter{Period: period, Category: in.Category, Order: expense.OrderSpentDesc, Limit: shown}
-		if in.Action == llm.ActionSummary {
-			f.Limit = 1
-		}
-		page, err := svc.List(ctx, scope, f)
-		if err != nil {
-			return b.validationReply(err)
-		}
-		desc := b.msgs.period(*period)
-		if in.Category != nil {
-			desc = fmt.Sprintf(b.msgs.InCategory, b.msgs.Categories[*in.Category]) + " " + desc
-		}
-		if in.Action == llm.ActionSummary {
-			return fmt.Sprintf(b.msgs.Summary, desc, page.Sum.Human(), b.cfg.Currency, page.Total), nil
-		}
-		if page.Total == 0 {
-			return fmt.Sprintf(b.msgs.ListEmpty, desc), nil
-		}
-		lines := []string{fmt.Sprintf(b.msgs.ListHeader, desc)}
-		for _, e := range page.Items {
-			lines = append(lines, "• "+b.msgs.expenseLine(e, b.cfg.Currency))
-		}
-		if page.Total > len(page.Items) {
-			lines = append(lines, fmt.Sprintf(b.msgs.ListTruncated, len(page.Items)))
-		}
-		lines = append(lines, fmt.Sprintf(b.msgs.ListFooter, page.Total, page.Sum.Human(), b.cfg.Currency))
-		return strings.Join(lines, "\n"), nil
-
-	case llm.ActionUpdate:
-		if in.Changes.Empty() {
-			return b.msgs.AskWhatChange, nil
-		}
-		target, reply, err := b.resolveTarget(ctx, svc, scope, in.Target)
-		if err != nil || reply != "" {
-			return reply, err
-		}
-		f := expense.Fields{UserID: actor, Amount: target.Amount, Category: target.Category, SpentAt: target.SpentAt, Comment: target.Comment}
-		if in.Changes.Amount != nil {
-			f.Amount = *in.Changes.Amount
-		}
-		if in.Changes.Category != nil {
-			f.Category = *in.Changes.Category
-		}
-		if in.Changes.Date != nil {
-			f.SpentAt = *in.Changes.Date
-		}
-		if in.Changes.Comment != nil {
-			f.Comment = in.Changes.Comment
-		}
-		updated, err := svc.Update(ctx, scope, target.ID, f)
-		if err != nil {
-			return b.validationReply(err)
-		}
-		return fmt.Sprintf(b.msgs.Updated, b.msgs.expenseLine(target, b.cfg.Currency), b.msgs.expenseLine(updated, b.cfg.Currency)), nil
-
-	case llm.ActionDelete:
-		target, reply, err := b.resolveTarget(ctx, svc, scope, in.Target)
-		if err != nil || reply != "" {
-			return reply, err
-		}
-		if err := svc.Delete(ctx, scope, target.ID); err != nil {
-			if errors.Is(err, expense.ErrNotFound) {
-				return b.msgs.NotFound, nil
-			}
-			return "", err
-		}
-		return fmt.Sprintf(b.msgs.Deleted, b.msgs.expenseLine(target, b.cfg.Currency)), nil
-
-	case llm.ActionClarify:
-		if in.Question != "" {
-			return in.Question, nil
-		}
-		return b.msgs.Default, nil
-	}
-	return b.msgs.Help, nil
-}
-
-// resolveTarget finds exactly one of the actor's expenses. It returns a
-// non-empty reply (and no expense) when the target is missing or ambiguous;
-// in that case the caller must not mutate anything.
-func (b *Bot) resolveTarget(ctx context.Context, svc *expense.Service, scope expense.Scope, t llm.Target) (expense.Expense, string, error) {
-	if !t.HasCriteria() {
-		return expense.Expense{}, b.msgs.AskWhichOne, nil
-	}
-	if t.Last {
-		page, err := svc.List(ctx, scope, expense.Filter{Order: expense.OrderCreatedDesc, Limit: 1})
-		if err != nil {
-			return expense.Expense{}, "", err
-		}
-		if len(page.Items) == 0 {
-			return expense.Expense{}, b.msgs.NotFound, nil
-		}
-		e := page.Items[0]
-		if !matches(e, t) {
-			return expense.Expense{}, fmt.Sprintf(b.msgs.LastMismatch, b.msgs.expenseLine(e, b.cfg.Currency)), nil
-		}
-		return e, "", nil
-	}
-
-	f := expense.Filter{Amount: t.Amount, Category: t.Category, TextContains: t.Text, Order: expense.OrderCreatedDesc, Limit: 5}
-	if t.Date != nil {
-		r := dates.Range{From: *t.Date, To: t.Date.AddDays(1)}
-		f.Period = &r
-	}
-	page, err := svc.List(ctx, scope, f)
-	if err != nil {
-		return expense.Expense{}, "", err
-	}
-	switch {
-	case page.Total == 0:
-		return expense.Expense{}, b.msgs.NotFound, nil
-	case page.Total > 1:
-		lines := []string{fmt.Sprintf(b.msgs.Ambiguous, page.Total)}
-		for _, e := range page.Items {
-			lines = append(lines, "• "+b.msgs.expenseLine(e, b.cfg.Currency))
-		}
-		if page.Total > len(page.Items) {
-			lines = append(lines, fmt.Sprintf(b.msgs.AndMore, page.Total-len(page.Items)))
-		}
-		return expense.Expense{}, strings.Join(lines, "\n"), nil
-	}
-	return page.Items[0], "", nil
-}
-
-func matches(e expense.Expense, t llm.Target) bool {
-	if t.Amount != nil && e.Amount != *t.Amount {
-		return false
-	}
-	if t.Category != nil && e.Category != *t.Category {
-		return false
-	}
-	if t.Date != nil && !e.SpentAt.Equal(*t.Date) {
-		return false
-	}
-	if t.Text != "" && (e.Comment == nil || !strings.Contains(strings.ToLower(*e.Comment), strings.ToLower(t.Text))) {
-		return false
-	}
-	return true
 }
 
 // Poller runs the long-polling loop.
@@ -353,7 +212,7 @@ func (b *Bot) Run(ctx context.Context, p Poller, heartbeatFile string) error {
 	var offset int64
 	backoff := time.Second
 	for ctx.Err() == nil {
-		touch(heartbeatFile)
+		Touch(heartbeatFile)
 		ups, err := p.GetUpdates(ctx, offset, 25)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -383,7 +242,8 @@ func (b *Bot) Run(ctx context.Context, p Poller, heartbeatFile string) error {
 	return nil
 }
 
-func touch(path string) {
+// Touch updates the heartbeat file read by the container health check.
+func Touch(path string) {
 	if path == "" {
 		return
 	}

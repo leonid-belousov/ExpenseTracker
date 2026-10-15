@@ -49,6 +49,7 @@ type Bot struct {
 	TelegramAPIURL string
 	Language       string
 	LLM            LLM
+	AgentMaxSteps  int
 	HeartbeatFile  string
 }
 
@@ -181,7 +182,20 @@ func LoadBot() (Bot, error) {
 		e.add("BOT_LANGUAGE must be 'ru' or 'en'")
 	}
 	c.LLM = loadLLM(&e)
+	steps, err := strconv.Atoi(env("AGENT_MAX_STEPS", "6"))
+	if err != nil || steps < 2 || steps > 20 {
+		e.add("AGENT_MAX_STEPS must be an integer between 2 and 20")
+		steps = 6
+	}
+	c.AgentMaxSteps = steps
 	return c, e.err()
+}
+
+// LoadLLM loads only the LLM settings (used by the eval runner).
+func LoadLLM() (LLM, error) {
+	var e errs
+	l := loadLLM(&e)
+	return l, e.err()
 }
 
 func loadLLM(e *errs) LLM {

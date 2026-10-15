@@ -14,10 +14,16 @@ import (
 	"expensetracker/internal/money"
 )
 
+type chatRow struct {
+	userID int64
+	msg    expense.ChatMessage
+}
+
 type state struct {
 	nextID   int64
 	expenses map[int64]expense.Expense
 	updates  map[int64]int64
+	chat     []chatRow
 }
 
 func (s *state) clone() *state {
@@ -28,6 +34,7 @@ func (s *state) clone() *state {
 	for k, v := range s.updates {
 		c.updates[k] = v
 	}
+	c.chat = append([]chatRow(nil), s.chat...)
 	return c
 }
 
@@ -189,6 +196,40 @@ func (s *Store) IsUpdateClaimed(_ context.Context, updateID int64) (bool, error)
 	defer s.lock()()
 	_, ok := s.st.updates[updateID]
 	return ok, nil
+}
+
+func (s *Store) AppendChat(_ context.Context, userID int64, msgs []expense.ChatMessage, pruneBefore time.Time) error {
+	defer s.lock()()
+	if err := s.takeFailure(); err != nil {
+		return err
+	}
+	now := s.Now().UTC()
+	for _, m := range msgs {
+		m.CreatedAt = now
+		s.st.chat = append(s.st.chat, chatRow{userID, m})
+	}
+	kept := s.st.chat[:0]
+	for _, r := range s.st.chat {
+		if r.userID != userID || !r.msg.CreatedAt.Before(pruneBefore) {
+			kept = append(kept, r)
+		}
+	}
+	s.st.chat = kept
+	return nil
+}
+
+func (s *Store) RecentChat(_ context.Context, userID int64, since time.Time, limit int) ([]expense.ChatMessage, error) {
+	defer s.lock()()
+	var out []expense.ChatMessage
+	for _, r := range s.st.chat {
+		if r.userID == userID && !r.msg.CreatedAt.Before(since) {
+			out = append(out, r.msg)
+		}
+	}
+	if len(out) > limit {
+		out = out[len(out)-limit:]
+	}
+	return out, nil
 }
 
 // All returns every stored expense ordered by id (test helper).

@@ -1,14 +1,20 @@
 # Family expense tracker: `docker compose up --build`
 #
+# Works without a .env file: every setting has a local-development default.
+# The bot stays idle until TELEGRAM_BOT_TOKEN is set (with LLM_PROVIDER)
+# (see .env.example). Optional local LLM: `docker compose --profile local-llm up`.
+# The default database password is for local use only: set POSTGRES_PASSWORD
+# in .env for anything else.
+#
 # The dashboard and API have NO authentication (product requirement). Their
 # ports are therefore published on loopback (127.0.0.1) only. Do not change
 # that without putting a trusted access-control layer in front (see README).
 
 x-app-env: &app-env
-  DATABASE_URL: postgres://${POSTGRES_USER:-expenses}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-expenses}?sslmode=disable
+  DATABASE_URL: postgres://${POSTGRES_USER:-expenses}:${POSTGRES_PASSWORD:-expenses-dev}@db:5432/${POSTGRES_DB:-expenses}?sslmode=disable
   APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
   CURRENCY: ${CURRENCY:-RUB}
-  FAMILY_MEMBERS: ${FAMILY_MEMBERS:-}
+  FAMILY_MEMBERS: ${FAMILY_MEMBERS:-111111111:Мама,222222222:Папа}
   LOG_LEVEL: ${LOG_LEVEL:-info}
 
 services:
@@ -17,7 +23,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-expenses}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-expenses-dev}
       POSTGRES_DB: ${POSTGRES_DB:-expenses}
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -83,6 +89,7 @@ services:
       LLM_MODEL: ${LLM_MODEL:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       LLM_TIMEOUT: ${LLM_TIMEOUT:-30s}
+      AGENT_MAX_STEPS: ${AGENT_MAX_STEPS:-6}
       BOT_HEARTBEAT_FILE: /tmp/expense-bot-heartbeat
     depends_on:
       migrate:
@@ -108,5 +115,18 @@ services:
       timeout: 3s
       retries: 5
 
+  # Optional local LLM (no API key). Start with
+  #   docker compose --profile local-llm up -d
+  #   docker compose exec ollama ollama pull qwen2.5:7b
+  # and set LLM_PROVIDER=openai, LLM_BASE_URL=http://ollama:11434/v1,
+  # LLM_MODEL=qwen2.5:7b, LLM_API_KEY=ollama in .env. Not published to the host.
+  ollama:
+    image: ollama/ollama:0.12.6
+    profiles: ["local-llm"]
+    restart: unless-stopped
+    volumes:
+      - ollama:/root/.ollama
+
 volumes:
   pgdata:
+  ollama:

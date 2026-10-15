@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"expensetracker/internal/agent"
 	"expensetracker/internal/bot"
 	"expensetracker/internal/dates"
 	"expensetracker/internal/expense"
-	"expensetracker/internal/llm"
 	"expensetracker/internal/telegram"
 )
 
@@ -29,7 +29,7 @@ func (r *recSender) SendMessage(_ context.Context, _ int64, text string) error {
 	return nil
 }
 
-// TestBotEndToEndOnPostgres drives the bot (with the mock parser) against the
+// TestBotEndToEndOnPostgres drives the bot (with the rule-based model) against the
 // real store: create, redelivery, isolation, ambiguity and delete.
 func TestBotEndToEndOnPostgres(t *testing.T) {
 	s, _ := setup(t)
@@ -38,7 +38,8 @@ func TestBotEndToEndOnPostgres(t *testing.T) {
 	clock := dates.FixedClock{T: time.Date(2026, 10, 15, 9, 0, 0, 0, time.UTC)}
 	svc := expense.NewService(s, []expense.Member{{ID: 1, Name: "A"}, {ID: 2, Name: "B"}}, moscow, clock)
 	out := &recSender{}
-	b := bot.New(svc, llm.ModelParser{Backend: llm.Mock{}}, out, bot.Config{Currency: "RUB", Language: "ru", LLMTimeout: time.Second},
+	ag := agent.New(agent.RuleModel{}, agent.Config{Currency: "RUB", Language: "ru", StepTimeout: time.Second})
+	b := bot.New(svc, ag, out, bot.Config{Currency: "RUB", Language: "ru"},
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	send := func(id, from int64, text string) string {

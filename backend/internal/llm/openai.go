@@ -12,8 +12,7 @@ import (
 )
 
 // OpenAICompatible calls any server implementing the OpenAI Chat Completions
-// API (OpenAI, OpenRouter, vLLM, Ollama, LM Studio, ...). It requests a JSON
-// object answer; the result is validated by Decode like every other backend.
+// API with function calling (OpenAI, OpenRouter, vLLM, Ollama, LM Studio, ...).
 type OpenAICompatible struct {
 	baseURL string
 	apiKey  string
@@ -22,71 +21,135 @@ type OpenAICompatible struct {
 }
 
 // NewOpenAICompatible builds a backend. baseURL is e.g. https://api.openai.com/v1.
+// timeout bounds one model call.
 func NewOpenAICompatible(baseURL, apiKey, model string, timeout time.Duration) *OpenAICompatible {
 	return &OpenAICompatible{baseURL: baseURL, apiKey: apiKey, model: model, http: &http.Client{Timeout: timeout}}
 }
 
-type chatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+type oaFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+	Strict      bool           `json:"strict"`
 }
 
-type chatRequest struct {
-	Model          string            `json:"model"`
-	Messages       []chatMessage     `json:"messages"`
-	Temperature    float64           `json:"temperature"`
-	ResponseFormat map[string]string `json:"response_format"`
+type oaTool struct {
+	Type     string     `json:"type"`
+	Function oaFunction `json:"function"`
 }
 
-type chatResponse struct {
+type oaToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+type oaMessage struct {
+	Role       string       `json:"role"`
+	Content    *string      `json:"content"`
+	ToolCalls  []oaToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string       `json:"tool_call_id,omitempty"`
+}
+
+type oaRequest struct {
+	Model       string            `json:"model"`
+	Messages    []json.RawMessage `json:"messages"`
+	Tools       []oaTool          `json:"tools"`
+	ToolChoice  string            `json:"tool_choice"`
+	Temperature float64           `json:"temperature"`
+}
+
+type oaResponse struct {
 	Choices []struct {
-		Message      chatMessage `json:"message"`
-		FinishReason string      `json:"finish_reason"`
+		Message      json.RawMessage `json:"message"`
+		FinishReason string          `json:"finish_reason"`
 	} `json:"choices"`
+	Usage struct {
+		PromptTokens     int64 `json:"prompt_tokens"`
+		CompletionTokens int64 `json:"completion_tokens"`
+	} `json:"usage"`
 }
 
-// Complete implements Completer.
-func (o *OpenAICompatible) Complete(ctx context.Context, system, user string) (string, error) {
-	body, err := json.Marshal(chatRequest{
-		Model:          o.model,
-		Messages:       []chatMessage{{Role: "system", Content: system}, {Role: "user", Content: user}},
-		Temperature:    0,
-		ResponseFormat: map[string]string{"type": "json_object"},
-	})
-	if err != nil {
-		return "", err
+func rawMsg(m oaMessage) json.RawMessage {
+	b, _ := json.Marshal(m)
+	return b
+}
+
+func strp(s string) *string { return &s }
+
+// Start implements Model.
+func (o *OpenAICompatible) Start(req Request) Session {
+	msgs := []json.RawMessage{rawMsg(oaMessage{Role: "system", Content: strp(req.System)})}
+	for _, h := range req.History {
+		msgs = append(msgs, rawMsg(oaMessage{Role: string(h.Role), Content: strp(h.Text)}))
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.baseURL+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return "", errors.New("invalid LLM_BASE_URL")
+	msgs = append(msgs, rawMsg(oaMessage{Role: "user", Content: strp(UserContent(req))}))
+	tools := make([]oaTool, len(req.Tools))
+	for i, t := range req.Tools {
+		tools[i] = oaTool{Type: "function", Function: oaFunction{Name: t.Name, Description: t.Description, Parameters: t.Schema, Strict: true}}
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+o.apiKey)
-	resp, err := o.http.Do(req)
+	return &openAISession{o: o, req: oaRequest{Model: o.model, Messages: msgs, Tools: tools, ToolChoice: "auto"}}
+}
+
+type openAISession struct {
+	o   *OpenAICompatible
+	req oaRequest
+}
+
+func (s *openAISession) Next(ctx context.Context, results []ToolResult) (Turn, error) {
+	for _, r := range results {
+		s.req.Messages = append(s.req.Messages, rawMsg(oaMessage{Role: "tool", ToolCallID: r.CallID, Content: strp(r.Content)}))
+	}
+	body, err := json.Marshal(s.req)
+	if err != nil {
+		return Turn{}, err
+	}
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, s.o.baseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return Turn{}, fmt.Errorf("%w: invalid LLM_BASE_URL", ErrUnavailable)
+	}
+	hreq.Header.Set("Content-Type", "application/json")
+	hreq.Header.Set("Authorization", "Bearer "+s.o.apiKey)
+	resp, err := s.o.http.Do(hreq)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
-			return "", context.DeadlineExceeded
+			return Turn{}, fmt.Errorf("%w: %w", ErrUnavailable, context.DeadlineExceeded)
 		}
-		// Do not wrap err: *url.Error prints the URL, which is fine, but keep
-		// logs uniform and free of request details.
-		return "", errors.New("LLM request failed")
+		// Do not wrap err: keep logs free of request details.
+		return Turn{}, fmt.Errorf("%w: LLM request failed", ErrUnavailable)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", errors.New("reading LLM response failed")
+		return Turn{}, fmt.Errorf("%w: reading LLM response failed", ErrUnavailable)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("LLM API status %d", resp.StatusCode)
+		return Turn{}, fmt.Errorf("%w: LLM API status %d", ErrUnavailable, resp.StatusCode)
 	}
-	var cr chatResponse
+	var cr oaResponse
 	if err := json.Unmarshal(data, &cr); err != nil || len(cr.Choices) == 0 {
-		return "", fmt.Errorf("%w: unexpected response shape", ErrMalformed)
+		return Turn{}, fmt.Errorf("%w: unexpected response shape", ErrMalformed)
 	}
+	turn := Turn{Usage: Usage{InputTokens: cr.Usage.PromptTokens, OutputTokens: cr.Usage.CompletionTokens}}
 	if cr.Choices[0].FinishReason == "length" {
-		return "", fmt.Errorf("%w: answer truncated", ErrMalformed)
+		return turn, fmt.Errorf("%w: answer truncated", ErrMalformed)
 	}
-	return cr.Choices[0].Message.Content, nil
+	var m oaMessage
+	if err := json.Unmarshal(cr.Choices[0].Message, &m); err != nil {
+		return turn, fmt.Errorf("%w: unexpected message shape", ErrMalformed)
+	}
+	// Append the assistant message exactly as received.
+	s.req.Messages = append(s.req.Messages, cr.Choices[0].Message)
+	if m.Content != nil {
+		turn.Text = *m.Content
+	}
+	for _, c := range m.ToolCalls {
+		turn.Calls = append(turn.Calls, ToolCall{ID: c.ID, Name: c.Function.Name, Input: json.RawMessage(c.Function.Arguments)})
+	}
+	return turn, nil
 }
 
 func isTimeout(err error) bool {

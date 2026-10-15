@@ -11,14 +11,22 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/option"
 )
 
-// Anthropic calls the Claude Messages API through the official SDK and asks
-// for schema-constrained JSON output.
+// Anthropic calls the Claude Messages API through the official SDK with
+// strict client tools.
 type Anthropic struct {
 	client anthropic.Client
 	model  string
+	extra  []option.RequestOption
 }
 
-// NewAnthropic builds a Claude backend. baseURL may be empty.
+// fallbackModels accept the server-side refusal fallback ("fallbacks":
+// "default"), which re-serves a declined request on another model.
+var fallbackModels = map[string]bool{
+	"claude-fable-5-1": true, "claude-opus-5-5": true, "claude-opus-5": true, "claude-sonnet-5-5": true,
+}
+
+// NewAnthropic builds a Claude backend. baseURL may be empty. timeout bounds
+// one model call.
 func NewAnthropic(apiKey, model, baseURL string, timeout time.Duration) *Anthropic {
 	opts := []option.RequestOption{
 		option.WithAPIKey(apiKey),
@@ -28,46 +36,116 @@ func NewAnthropic(apiKey, model, baseURL string, timeout time.Duration) *Anthrop
 	if baseURL != "" {
 		opts = append(opts, option.WithBaseURL(baseURL))
 	}
-	return &Anthropic{client: anthropic.NewClient(opts...), model: model}
+	a := &Anthropic{client: anthropic.NewClient(opts...), model: model}
+	if baseURL == "" && fallbackModels[model] {
+		a.extra = []option.RequestOption{
+			option.WithHeaderAdd("anthropic-beta", string(anthropic.AnthropicBetaServerSideFallback2026_07_01)),
+			option.WithJSONSet("fallbacks", "default"),
+		}
+	}
+	return a
 }
 
-// Complete implements Completer.
-func (a *Anthropic) Complete(ctx context.Context, system, user string) (string, error) {
-	resp, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
+func anthropicTools(specs []ToolSpec) []anthropic.ToolUnionParam {
+	out := make([]anthropic.ToolUnionParam, len(specs))
+	for i, s := range specs {
+		schema := anthropic.ToolInputSchemaParam{
+			Properties:  s.Schema["properties"],
+			ExtraFields: map[string]any{"additionalProperties": false},
+		}
+		if req, ok := s.Schema["required"].([]string); ok {
+			schema.Required = req
+		}
+		t := anthropic.ToolParam{
+			Name:        s.Name,
+			Description: anthropic.String(s.Description),
+			InputSchema: schema,
+			Strict:      anthropic.Bool(true),
+		}
+		out[i] = anthropic.ToolUnionParam{OfTool: &t}
+	}
+	return out
+}
+
+// Start implements Model.
+func (a *Anthropic) Start(req Request) Session {
+	var msgs []anthropic.MessageParam
+	for _, h := range req.History {
+		block := anthropic.NewTextBlock(h.Text)
+		if h.Role == RoleAssistant {
+			msgs = append(msgs, anthropic.NewAssistantMessage(block))
+		} else {
+			msgs = append(msgs, anthropic.NewUserMessage(block))
+		}
+	}
+	msgs = append(msgs, anthropic.NewUserMessage(anthropic.NewTextBlock(UserContent(req))))
+	return &anthropicSession{a: a, params: anthropic.MessageNewParams{
 		Model:     anthropic.Model(a.model),
-		MaxTokens: 4096,
-		System:    []anthropic.TextBlockParam{{Text: system}},
-		Messages:  []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock(user))},
+		MaxTokens: 8192,
+		// The system prompt and tool list are fixed, so tools+system form a
+		// stable, cacheable prefix.
+		System:   []anthropic.TextBlockParam{{Text: req.System, CacheControl: anthropic.NewCacheControlEphemeralParam()}},
+		Tools:    anthropicTools(req.Tools),
+		Messages: msgs,
 		OutputConfig: anthropic.OutputConfigParam{
-			// Parsing a short message is a simple task; low effort keeps
+			// Expense bookkeeping is simple tool use; low effort keeps
 			// latency and cost down.
 			Effort: anthropic.OutputConfigEffortLow,
-			Format: anthropic.JSONOutputFormatParam{Schema: IntentSchema()},
 		},
-	})
+	}}
+}
+
+type anthropicSession struct {
+	a      *Anthropic
+	params anthropic.MessageNewParams
+}
+
+func (s *anthropicSession) Next(ctx context.Context, results []ToolResult) (Turn, error) {
+	if len(results) > 0 {
+		// All results of one turn go back in a single user message.
+		blocks := make([]anthropic.ContentBlockParamUnion, len(results))
+		for i, r := range results {
+			blocks[i] = anthropic.NewToolResultBlock(r.CallID, r.Content, r.IsError)
+		}
+		s.params.Messages = append(s.params.Messages, anthropic.NewUserMessage(blocks...))
+	}
+	resp, err := s.a.client.Messages.New(ctx, s.params, s.a.extra...)
 	if err != nil {
 		var apiErr *anthropic.Error
 		if errors.As(err, &apiErr) {
 			// Never include the request/response dump: it can contain the
-			// user's message. The status code is enough to diagnose.
-			return "", fmt.Errorf("anthropic API status %d", apiErr.StatusCode)
+			// user's messages. The status code is enough to diagnose.
+			return Turn{}, fmt.Errorf("%w: anthropic API status %d", ErrUnavailable, apiErr.StatusCode)
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
-			return "", context.DeadlineExceeded
+			return Turn{}, fmt.Errorf("%w: %w", ErrUnavailable, context.DeadlineExceeded)
 		}
-		return "", errors.New("anthropic request failed")
+		return Turn{}, fmt.Errorf("%w: anthropic request failed", ErrUnavailable)
 	}
+	turn := Turn{Usage: Usage{
+		InputTokens:     resp.Usage.InputTokens + resp.Usage.CacheCreationInputTokens + resp.Usage.CacheReadInputTokens,
+		OutputTokens:    resp.Usage.OutputTokens,
+		CacheReadTokens: resp.Usage.CacheReadInputTokens,
+	}}
 	switch resp.StopReason {
 	case anthropic.StopReasonRefusal:
-		return "", errors.New("model declined the request")
+		return turn, fmt.Errorf("%w: model declined the request", ErrUnavailable)
 	case anthropic.StopReasonMaxTokens:
-		return "", fmt.Errorf("%w: answer truncated", ErrMalformed)
+		return turn, fmt.Errorf("%w: answer truncated", ErrMalformed)
 	}
-	var b strings.Builder
+	// Append the answer verbatim (thinking blocks included) before running
+	// any tool: the transcript stays append-only.
+	s.params.Messages = append(s.params.Messages, resp.ToParam())
+
+	var text strings.Builder
 	for _, block := range resp.Content {
-		if t, ok := block.AsAny().(anthropic.TextBlock); ok {
-			b.WriteString(t.Text)
+		switch b := block.AsAny().(type) {
+		case anthropic.TextBlock:
+			text.WriteString(b.Text)
+		case anthropic.ToolUseBlock:
+			turn.Calls = append(turn.Calls, ToolCall{ID: b.ID, Name: b.Name, Input: []byte(b.JSON.Input.Raw())})
 		}
 	}
-	return b.String(), nil
+	turn.Text = strings.TrimSpace(text.String())
+	return turn, nil
 }

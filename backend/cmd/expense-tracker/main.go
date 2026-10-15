@@ -20,12 +20,12 @@ import (
 	"syscall"
 	"time"
 
+	"expensetracker/internal/agent"
 	"expensetracker/internal/api"
 	"expensetracker/internal/bot"
 	"expensetracker/internal/config"
 	"expensetracker/internal/dates"
 	"expensetracker/internal/expense"
-	"expensetracker/internal/llm"
 	"expensetracker/internal/store/postgres"
 	"expensetracker/internal/telegram"
 )
@@ -121,21 +121,18 @@ func runAPI(ctx context.Context) error {
 }
 
 func runBot(ctx context.Context) error {
+	if strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN")) == "" {
+		return idleBot(ctx)
+	}
 	cfg, err := config.LoadBot()
 	if err != nil {
 		return err
 	}
 	log := newLogger(cfg.LogLevel)
 
-	var backend llm.Completer
-	switch cfg.LLM.Provider {
-	case "anthropic":
-		backend = llm.NewAnthropic(cfg.LLM.APIKey, cfg.LLM.Model, cfg.LLM.BaseURL, cfg.LLM.Timeout)
-	case "openai":
-		backend = llm.NewOpenAICompatible(cfg.LLM.BaseURL, cfg.LLM.APIKey, cfg.LLM.Model, cfg.LLM.Timeout)
-	case "mock":
-		log.Warn("LLM_PROVIDER=mock: using the rule-based development parser. Not for production use.")
-		backend = llm.Mock{}
+	model := agent.NewModel(cfg.LLM)
+	if cfg.LLM.Provider == "mock" {
+		log.Warn("LLM_PROVIDER=mock: using the rule-based development model. Not for production use.")
 	}
 
 	pool, err := postgres.Connect(ctx, cfg.DatabaseURL, dbWait)
@@ -157,11 +154,34 @@ func runBot(ctx context.Context) error {
 		return fmt.Errorf("cannot reach Telegram: %w", err)
 	}
 
-	b := bot.New(svc, llm.ModelParser{Backend: backend}, tg, bot.Config{
-		Currency: cfg.Currency, Language: cfg.Language, LLMTimeout: cfg.LLM.Timeout,
-	}, log)
+	ag := agent.New(model, agent.Config{
+		Currency: cfg.Currency, Language: cfg.Language, MaxSteps: cfg.AgentMaxSteps, StepTimeout: cfg.LLM.Timeout,
+	})
+	b := bot.New(svc, ag, tg, bot.Config{Currency: cfg.Currency, Language: cfg.Language}, log)
 	log.Info("bot started", "llm_provider", cfg.LLM.Provider, "llm_model", cfg.LLM.Model, "members", len(cfg.Members), "language", cfg.Language)
 	return b.Run(ctx, tg, cfg.HeartbeatFile)
+}
+
+// idleBot runs when no Telegram token is configured, so that the stack
+// starts with zero configuration: instead of exiting (and being restarted in
+// a loop by Docker), the bot says once what is missing and waits, keeping its
+// heartbeat fresh. A configured but invalid setup still fails loudly.
+func idleBot(ctx context.Context) error {
+	log := newLogger(os.Getenv("LOG_LEVEL"))
+	log.Warn("bot disabled: TELEGRAM_BOT_TOKEN is not set. Set TELEGRAM_BOT_TOKEN, FAMILY_MEMBERS and LLM_PROVIDER " +
+		"(see .env.example), then run `docker compose up -d bot`. The dashboard and API work without the bot.")
+	heartbeat := os.Getenv("BOT_HEARTBEAT_FILE")
+	if heartbeat == "" {
+		heartbeat = "/tmp/expense-bot-heartbeat"
+	}
+	for {
+		bot.Touch(heartbeat)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(30 * time.Second):
+		}
+	}
 }
 
 func runHealthcheck(args []string) error {

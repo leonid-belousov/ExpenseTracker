@@ -84,6 +84,30 @@ func (s *Service) IsUpdateClaimed(ctx context.Context, updateID int64) (bool, er
 	return s.store.IsUpdateClaimed(ctx, updateID)
 }
 
+// Now returns the current instant.
+func (s *Service) Now() time.Time { return s.clock.Now() }
+
+// AppendChat stores conversation messages of a member (truncated to
+// MaxChatMessageLength) and prunes that member's messages older than
+// pruneBefore.
+func (s *Service) AppendChat(ctx context.Context, userID int64, msgs []ChatMessage, pruneBefore time.Time) error {
+	out := make([]ChatMessage, 0, len(msgs))
+	for _, m := range msgs {
+		if r := []rune(m.Content); len(r) > MaxChatMessageLength {
+			m.Content = string(r[:MaxChatMessageLength])
+		}
+		if m.Content != "" {
+			out = append(out, m)
+		}
+	}
+	return s.store.AppendChat(ctx, userID, out, pruneBefore)
+}
+
+// RecentChat returns a member's recent conversation, oldest first.
+func (s *Service) RecentChat(ctx context.Context, userID int64, since time.Time, limit int) ([]ChatMessage, error) {
+	return s.store.RecentChat(ctx, userID, since, limit)
+}
+
 // Ping checks storage connectivity.
 func (s *Service) Ping(ctx context.Context) error { return s.store.Ping(ctx) }
 

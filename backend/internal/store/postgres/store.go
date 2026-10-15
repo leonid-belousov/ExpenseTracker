@@ -214,6 +214,41 @@ func (s *Store) ClaimUpdate(ctx context.Context, updateID, userID int64) (bool, 
 	return tag.RowsAffected() == 1, nil
 }
 
+func (s *Store) AppendChat(ctx context.Context, userID int64, msgs []expense.ChatMessage, pruneBefore time.Time) error {
+	for _, m := range msgs {
+		if _, err := s.db.Exec(ctx, `INSERT INTO chat_messages (user_id, role, content) VALUES ($1, $2, $3)`,
+			userID, string(m.Role), m.Content); err != nil {
+			return err
+		}
+	}
+	_, err := s.db.Exec(ctx, `DELETE FROM chat_messages WHERE user_id = $1 AND created_at < $2`, userID, pruneBefore)
+	return err
+}
+
+func (s *Store) RecentChat(ctx context.Context, userID int64, since time.Time, limit int) ([]expense.ChatMessage, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT role, content, created_at FROM (
+			SELECT id, role, content, created_at FROM chat_messages
+			WHERE user_id = $1 AND created_at >= $2
+			ORDER BY created_at DESC, id DESC LIMIT $3
+		) recent ORDER BY created_at, id`, userID, since, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []expense.ChatMessage
+	for rows.Next() {
+		var m expense.ChatMessage
+		var role string
+		if err := rows.Scan(&role, &m.Content, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		m.Role, m.CreatedAt = expense.ChatRole(role), m.CreatedAt.UTC()
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) IsUpdateClaimed(ctx context.Context, updateID int64) (bool, error) {
 	var exists bool
 	err := s.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM telegram_updates WHERE update_id = $1)`, updateID).Scan(&exists)

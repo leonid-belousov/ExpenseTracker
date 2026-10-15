@@ -36,7 +36,7 @@ func setup(t *testing.T) (*Store, *pgxpool.Pool) {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS expenses, telegram_updates, schema_migrations`); err != nil {
+	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS expenses, telegram_updates, chat_messages, schema_migrations`); err != nil {
 		t.Fatal(err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -204,5 +204,34 @@ func TestDatabaseConstraintsBackstopValidation(t *testing.T) {
 		if _, err := pool.Exec(ctx, q); err == nil {
 			t.Errorf("constraint not enforced: %s", q)
 		}
+	}
+}
+
+func TestChatMemory(t *testing.T) {
+	s, _ := setup(t)
+	ctx := context.Background()
+	msgs := []expense.ChatMessage{{Role: expense.ChatUser, Content: "удали такси"}, {Role: expense.ChatAssistant, Content: "Какую?\n[ids: 1, 2]"}}
+	if err := s.AppendChat(ctx, 1, msgs, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendChat(ctx, 2, []expense.ChatMessage{{Role: expense.ChatUser, Content: "чужое"}}, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.RecentChat(ctx, 1, time.Now().Add(-time.Minute), 10)
+	if err != nil || len(got) != 2 || got[0].Role != expense.ChatUser || got[1].Content != msgs[1].Content {
+		t.Fatalf("recent %+v %v", got, err)
+	}
+	if got, _ := s.RecentChat(ctx, 1, time.Now().Add(-time.Minute), 1); len(got) != 1 || got[0].Role != expense.ChatAssistant {
+		t.Fatalf("limit keeps the newest: %+v", got)
+	}
+	// Pruning removes the user's old messages only.
+	if err := s.AppendChat(ctx, 1, nil, time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.RecentChat(ctx, 1, time.Time{}, 10); len(got) != 0 {
+		t.Fatalf("not pruned: %+v", got)
+	}
+	if got, _ := s.RecentChat(ctx, 2, time.Time{}, 10); len(got) != 1 {
+		t.Fatalf("pruned another user: %+v", got)
 	}
 }
