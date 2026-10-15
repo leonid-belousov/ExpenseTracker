@@ -1,0 +1,104 @@
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --text: #1d2330;
+  --muted: #667085;
+  --border: #d8dce3;
+  --accent: #2563eb;
+  --accent-text: #ffffff;
+  --danger: #c0262d;
+  --danger-bg: #fdecec;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b;
+    --surface: #1b2029;
+    --text: #e6e9ef;
+    --muted: #98a2b3;
+    --border: #2d3442;
+    --accent: #5b8cff;
+    --accent-text: #0b1020;
+    --danger: #ff6b6b;
+    --danger-bg: #3a1d20;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+.topbar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 14px 20px; background: var(--surface); border-bottom: 1px solid var(--border);
+}
+.topbar h1 { font-size: 1.2rem; margin: 0; }
+main { max-width: 1100px; margin: 0 auto; padding: 16px 20px 40px; }
+
+.btn {
+  font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--text); cursor: pointer;
+}
+.btn:hover:not(:disabled) { border-color: var(--accent); }
+.btn:disabled { opacity: .55; cursor: default; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+.btn.small { padding: 4px 10px; font-size: .9rem; }
+.btn.danger { color: var(--danger); }
+
+.filters {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px;
+}
+label { display: flex; flex-direction: column; gap: 4px; font-size: .85rem; color: var(--muted); }
+input, select {
+  font: inherit; color: var(--text); background: var(--bg);
+  border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; min-width: 0;
+}
+.presets { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; }
+.field-error { color: var(--danger); font-size: .8rem; }
+.filters-error { grid-column: 1 / -1; margin: 0; }
+
+.summary { margin: 16px 2px 8px; font-weight: 600; }
+.state { padding: 18px; text-align: center; color: var(--muted); }
+.state.error { color: var(--danger); background: var(--danger-bg); border-radius: 10px; }
+.banner { background: var(--danger-bg); color: var(--danger); padding: 10px 14px; border-radius: 10px; margin: 0 0 12px; }
+
+.expenses { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.expenses.stale { opacity: .5; }
+.expenses th, .expenses td { padding: 9px 12px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+.expenses th { font-size: .8rem; color: var(--muted); font-weight: 600; }
+.expenses .num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.expenses .comment { overflow-wrap: anywhere; }
+.row-actions { white-space: nowrap; text-align: right; }
+.row-actions .btn + .btn { margin-left: 6px; }
+
+.pager { display: flex; justify-content: center; align-items: center; gap: 12px; margin-top: 14px; color: var(--muted); }
+
+dialog {
+  border: 1px solid var(--border); border-radius: 12px; padding: 0; width: min(440px, calc(100vw - 32px));
+  background: var(--surface); color: var(--text);
+}
+dialog::backdrop { background: rgba(0, 0, 0, .45); }
+.edit-form { display: flex; flex-direction: column; gap: 12px; padding: 20px; }
+.edit-form h2 { margin: 0 0 4px; font-size: 1.1rem; }
+.actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+@media (max-width: 760px) {
+  .filters { grid-template-columns: 1fr 1fr; }
+  .topbar { padding: 12px 16px; }
+  main { padding: 12px 16px 32px; }
+  .expenses, .expenses tbody, .expenses tr, .expenses td { display: block; width: 100%; }
+  .expenses { border: 0; background: none; }
+  .expenses thead { display: none; }
+  .expenses tr { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px; padding: 6px 0; }
+  .expenses td { border: 0; padding: 4px 14px; display: flex; justify-content: space-between; gap: 12px; text-align: right; }
+  .expenses td::before { content: attr(data-label); color: var(--muted); font-size: .8rem; text-align: left; }
+  .expenses td.row-actions { justify-content: flex-end; padding-top: 8px; }
+  .expenses td.row-actions::before { content: none; }
+}
+@media (max-width: 420px) {
+  .filters { grid-template-columns: 1fr; }
+  .topbar h1 { font-size: 1.05rem; }
+}

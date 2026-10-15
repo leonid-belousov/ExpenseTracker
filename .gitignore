@@ -1,0 +1,7 @@
+.env
+backend/expense-tracker
+backend/expense-tracker.exe
+*.test
+coverage.out
+frontend/node_modules/
+frontend/dist/
