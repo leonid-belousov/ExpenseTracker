@@ -1,34 +1,36 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
-import { api, ApiError } from './api';
-import { presetRange, humanDate } from './dates';
-import { CATEGORY_LABELS, formatMoney } from './format';
+import { api, ApiError, describeError } from './api';
+import { presetRange } from './dates';
+import { useI18n } from './i18n/I18nProvider';
 import { ExpenseDialog } from './components/ExpenseDialog';
 import { ExpenseTable } from './components/ExpenseTable';
-import { FiltersBar, rangeError } from './components/FiltersBar';
+import { FiltersBar, hasRangeError } from './components/FiltersBar';
+import { LanguageSwitcher } from './components/LanguageSwitcher';
 import type { AppConfig, Expense, ExpenseInput, ExpensePage, Filters } from './types';
 
 const PAGE_SIZE = 50;
 
+// Errors are stored as values and translated at render time, so switching
+// the language also re-translates messages that are already on screen.
 type ListState =
   | { status: 'loading'; page: ExpensePage | null }
   | { status: 'ready'; page: ExpensePage }
-  | { status: 'error'; message: string };
+  | { status: 'error'; error: unknown };
+
+type Banner = { kind: 'alreadyDeleted' } | { kind: 'deleteFailed'; error: unknown } | null;
 
 // `null` = dialog closed; `{ expense: null }` = create; otherwise edit.
 type DialogState = { expense: Expense | null } | null;
 
-function errorMessage(e: unknown): string {
-  return e instanceof Error ? e.message : 'непредвиденная ошибка';
-}
-
 export function App() {
+  const { m, money, date } = useI18n();
   const [config, setConfig] = useState<AppConfig | null>(null);
-  const [configError, setConfigError] = useState<string | null>(null);
+  const [configError, setConfigError] = useState<unknown>(null);
   const [filters, setFilters] = useState<Filters | null>(null);
   const [offset, setOffset] = useState(0);
   const [list, setList] = useState<ListState>({ status: 'loading', page: null });
   const [reloadKey, setReloadKey] = useState(0);
-  const [banner, setBanner] = useState<string | null>(null);
+  const [banner, setBanner] = useState<Banner>(null);
   const [dialog, setDialog] = useState<DialogState>(null);
 
   useEffect(() => {
@@ -39,21 +41,21 @@ export function App() {
         const [from, to] = presetRange('this_month', c.today);
         setFilters({ userId: '', category: '', from, to });
       })
-      .catch((e) => setConfigError(errorMessage(e)));
+      .catch((e) => setConfigError(e ?? new Error()));
   }, []);
 
   // Load the list whenever filters, page or reloadKey change. Superseded
   // requests are aborted so stale responses never overwrite newer data.
   useEffect(() => {
-    if (!filters || rangeError(filters)) return;
+    if (!filters || hasRangeError(filters)) return;
     const ctrl = new AbortController();
     setList((prev) => ({ status: 'loading', page: prev.status === 'error' ? null : prev.page }));
     api
       .list(filters, PAGE_SIZE, offset, ctrl.signal)
       .then((page) => setList({ status: 'ready', page }))
-      .catch((e) => {
+      .catch((error) => {
         if (ctrl.signal.aborted) return;
-        setList({ status: 'error', message: errorMessage(e) });
+        setList({ status: 'error', error });
       });
     return () => ctrl.abort();
   }, [filters, offset, reloadKey]);
@@ -77,7 +79,7 @@ export function App() {
   async function remove(e: Expense) {
     if (!config) return;
     const ok = window.confirm(
-      `Удалить трату ${formatMoney(e.amount, config.currency)} (${CATEGORY_LABELS[e.category]}, ${humanDate(e.spent_at)}, ${e.member_name})?`,
+      m.remove.confirm(money(e.amount, config.currency), m.categories[e.category], date(e.spent_at), e.member_name),
     );
     if (!ok) return;
     try {
@@ -85,52 +87,52 @@ export function App() {
       setBanner(null);
       const page = list.status === 'ready' ? list.page : null;
       if (page && page.items.length === 1 && offset > 0) setOffset(Math.max(0, offset - PAGE_SIZE));
-    } catch (err) {
-      setBanner(
-        err instanceof ApiError && err.status === 404
-          ? 'Трата уже была удалена.'
-          : 'Не удалось удалить трату: ' + errorMessage(err),
-      );
+    } catch (error) {
+      setBanner(error instanceof ApiError && error.kind === 'notFound' ? { kind: 'alreadyDeleted' } : { kind: 'deleteFailed', error });
     }
     reload();
   }
 
-  if (configError) {
+  if (configError !== null) {
     return (
       <Shell canAdd={false} onAdd={() => {}}>
-        <div className="state error">Не удалось загрузить настройки: {configError}</div>
+        <div className="state error">{m.list.configFailed(describeError(configError, m))}</div>
       </Shell>
     );
   }
   if (!config || !filters) {
     return (
       <Shell canAdd={false} onAdd={() => {}}>
-        <div className="state">Загрузка…</div>
+        <div className="state">{m.list.loading}</div>
       </Shell>
     );
   }
 
   const page = list.status === 'error' ? null : list.page;
   const pages = page ? Math.max(1, Math.ceil(page.total / PAGE_SIZE)) : 1;
+  const bannerText =
+    banner?.kind === 'alreadyDeleted'
+      ? m.remove.alreadyDeleted
+      : banner?.kind === 'deleteFailed'
+        ? m.remove.failed(describeError(banner.error, m))
+        : null;
 
   return (
     <Shell canAdd onAdd={() => setDialog({ expense: null })}>
-      {banner && (
+      {bannerText && (
         <div className="banner" role="alert">
-          {banner}
+          {bannerText}
         </div>
       )}
       <FiltersBar config={config} filters={filters} onChange={changeFilters} />
 
       <section className="summary" aria-live="polite">
-        {page ? `Найдено: ${page.total} · Сумма: ${formatMoney(page.sum, config.currency)}` : '—'}
+        {page ? m.list.summary(page.total, money(page.sum, config.currency)) : '—'}
       </section>
 
-      {list.status === 'error' && <div className="state error">Не удалось загрузить траты: {list.message}</div>}
-      {list.status === 'loading' && !page && <div className="state">Загрузка…</div>}
-      {page && page.items.length === 0 && list.status === 'ready' && (
-        <div className="state empty">Трат по выбранным фильтрам нет.</div>
-      )}
+      {list.status === 'error' && <div className="state error">{m.list.loadFailed(describeError(list.error, m))}</div>}
+      {list.status === 'loading' && !page && <div className="state">{m.list.loading}</div>}
+      {page && page.items.length === 0 && list.status === 'ready' && <div className="state empty">{m.list.empty}</div>}
       {page && page.items.length > 0 && (
         <ExpenseTable
           items={page.items}
@@ -143,18 +145,16 @@ export function App() {
       {page && pages > 1 && (
         <nav className="pager">
           <button type="button" className="btn small" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}>
-            ← Назад
+            {m.list.prev}
           </button>
-          <span>
-            Страница {Math.floor(offset / PAGE_SIZE) + 1} из {pages}
-          </span>
+          <span>{m.list.page(Math.floor(offset / PAGE_SIZE) + 1, pages)}</span>
           <button
             type="button"
             className="btn small"
             disabled={offset + PAGE_SIZE >= page.total}
             onClick={() => setOffset(offset + PAGE_SIZE)}
           >
-            Вперёд →
+            {m.list.next}
           </button>
         </nav>
       )}
@@ -173,13 +173,17 @@ export function App() {
 }
 
 function Shell({ children, canAdd, onAdd }: { children: ReactNode; canAdd: boolean; onAdd: () => void }) {
+  const { m } = useI18n();
   return (
     <>
       <header className="topbar">
-        <h1>Семейные расходы</h1>
-        <button type="button" className="btn primary" disabled={!canAdd} onClick={onAdd}>
-          + Добавить трату
-        </button>
+        <h1>{m.header.title}</h1>
+        <div className="topbar-actions">
+          <LanguageSwitcher />
+          <button type="button" className="btn primary" disabled={!canAdd} onClick={onAdd}>
+            {m.header.add}
+          </button>
+        </div>
       </header>
       <main>{children}</main>
     </>

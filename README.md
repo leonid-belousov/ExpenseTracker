@@ -86,8 +86,18 @@ React 19 + TypeScript, built with Vite. No UI or state libraries: plain componen
 | `src/components/ExpenseTable.tsx` | Table that becomes cards at phone width. |
 | `src/components/ExpenseDialog.tsx` | Create/edit form in a modal `<dialog>`, with client and API field errors. |
 | `src/api.ts` | Typed REST client and `ApiError`. Converts the inclusive "по дату" into the API's exclusive `to`. |
-| `src/dates.ts`, `src/format.ts` | Calendar-date arithmetic in UTC (Monday weeks), exact money formatting without floats, form validation, category labels. |
+| `src/dates.ts`, `src/format.ts` | Calendar-date arithmetic in UTC (Monday weeks), locale-aware exact money and date formatting without floats, form validation (returns language-neutral codes). |
+| `src/i18n/` | Typed dictionaries (`messages.ts`), `I18nProvider` / `useI18n`, persistence of the chosen language. |
+| `src/components/LanguageSwitcher.tsx` | RU / EN switch in the header. |
 | `nginx.conf` | Serves the build, proxies `/api` to the `api` service, sends security headers (CSP etc.). |
+
+#### Languages (i18n)
+
+The dashboard supports **Russian (default)** and **English**. The RU / EN switch is in the header. The choice is saved in the browser's `localStorage` (`expense-tracker.locale`); if storage is unavailable or holds an unknown value, Russian is used. Switching changes all texts, category labels, number and date formats (`1 200,50 RUB` / `15.10.2026` vs `1,200.50 RUB` / `Oct 15, 2026`), the page `<title>` and `<html lang>`. Errors are stored as codes and translated at render time, so messages already on screen switch too.
+
+There is no i18n library: dictionaries are plain typed objects. `ru` is the reference, and `en` is typed as `Messages`, so a missing key or a wrong parameter list is a compile error; a test also checks that both dictionaries have the same keys and that English has no Cyrillic left. Parameterised messages are functions, e.g. `page: (page, pages) => ...`. To add a language, add its code to `LOCALES`, a dictionary typed as `Messages`, and an entry in `dictionaries` and in `LanguageSwitcher`.
+
+API data is not translated: the backend returns canonical category keys (translated in the UI) and English error texts. The UI shows its own localised message per error kind and per rejected field instead of the raw server text. The Telegram bot's language is configured separately (`BOT_LANGUAGE`).
 
 The browser talks only to its own origin (`/api` is proxied), so CORS is not needed in normal use. The dashboard shows a list or table only after the API confirms a load, and closes the edit dialog only after the API confirms the save.
 

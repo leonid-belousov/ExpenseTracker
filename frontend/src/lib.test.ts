@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ApiError, buildListQuery, requestForTest } from './api';
-import { addDays, humanDate, presetRange } from './dates';
-import { formatMoney, normalizeAmount, validateDraft } from './format';
+import { ApiError, buildListQuery, describeError, request } from './api';
+import { addDays, presetRange } from './dates';
+import { formatDate, formatMoney, normalizeAmount, validateDraft } from './format';
+import { dictionaries } from './i18n/messages';
 
 describe('dates', () => {
   it('weeks start on Monday, including when today is Sunday', () => {
@@ -19,7 +20,6 @@ describe('dates', () => {
   it('adds days without time-zone drift', () => {
     expect(addDays('2026-03-28', 2)).toBe('2026-03-30');
     expect(addDays('2026-12-31', 1)).toBe('2027-01-01');
-    expect(humanDate('2026-10-05')).toBe('05.10.2026');
   });
 });
 
@@ -39,15 +39,25 @@ describe('list query', () => {
   });
 });
 
-describe('money', () => {
-  it('formats exact decimal strings', () => {
-    expect(formatMoney('1200.5', 'RUB')).toBe('1 200,50 RUB');
-    expect(formatMoney('0.30', 'RUB')).toBe('0,30 RUB');
-    expect(formatMoney('1234567', 'RUB')).toBe('1 234 567,00 RUB');
+describe('locale-aware formatting', () => {
+  it('formats exact decimal strings per locale without floats', () => {
+    expect(formatMoney('1200.5', 'RUB', 'ru')).toBe('1 200,50 RUB');
+    expect(formatMoney('1200.5', 'RUB', 'en')).toBe('1,200.50 RUB');
+    expect(formatMoney('0.30', 'RUB', 'ru')).toBe('0,30 RUB');
+    expect(formatMoney('1234567', 'USD', 'en')).toBe('1,234,567.00 USD');
+    expect(formatMoney('99999999999999999.99', 'RUB', 'en')).toBe('99,999,999,999,999,999.99 RUB');
+  });
+
+  it('formats calendar dates per locale without shifting the day', () => {
+    const { ru, en } = dictionaries;
+    expect(formatDate('2026-10-05', ru.meta.intlLocale, ru.meta.dateOptions)).toBe('05.10.2026');
+    expect(formatDate('2026-10-05', en.meta.intlLocale, en.meta.dateOptions)).toBe('Oct 5, 2026');
+    expect(formatDate('2026-01-01', en.meta.intlLocale, en.meta.dateOptions)).toBe('Jan 1, 2026');
   });
 
   it('normalises user input', () => {
     expect(normalizeAmount(' 1 200,5 ')).toBe('1200.5');
+    expect(normalizeAmount('1 200.50')).toBe('1200.50');
   });
 });
 
@@ -61,18 +71,22 @@ describe('draft validation', () => {
   });
 
   it.each([
-    ['0', 'amount'],
-    ['-5', 'amount'],
-    ['1.234', 'amount'],
-    ['abc', 'amount'],
-  ])('rejects amount %s', (amount, field) => {
-    expect(validateDraft({ ...base, amount }, '2026-10-15').errors).toHaveProperty(field);
+    ['0', 'amountPositive'],
+    ['0.00', 'amountPositive'],
+    ['-5', 'amountInvalid'],
+    ['1.234', 'amountInvalid'],
+    ['abc', 'amountInvalid'],
+  ])('rejects amount %s with code %s', (amount, code) => {
+    expect(validateDraft({ ...base, amount }, '2026-10-15').errors.amount).toBe(code);
   });
 
-  it('rejects missing member/category and future dates', () => {
+  it('returns language-neutral codes that every locale can translate', () => {
     const { errors, input } = validateDraft({ ...base, userId: '', category: '', spentAt: '2026-10-16' }, '2026-10-15');
     expect(input).toBeUndefined();
-    expect(Object.keys(errors).sort()).toEqual(['category', 'spent_at', 'user_id']);
+    expect(errors).toEqual({ user_id: 'memberRequired', category: 'categoryRequired', spent_at: 'dateFuture' });
+    for (const m of Object.values(dictionaries)) {
+      for (const code of Object.values(errors)) expect(m.validation[code!]).toBeTruthy();
+    }
   });
 
   it('sends an empty comment as null', () => {
@@ -81,26 +95,42 @@ describe('draft validation', () => {
 });
 
 describe('api client', () => {
-  it('surfaces API field errors', async () => {
+  const ru = dictionaries.ru;
+  const en = dictionaries.en;
+
+  it('classifies API validation errors and keeps raw field errors', async () => {
     const body = { error: { code: 'validation_error', message: 'request validation failed', fields: { amount: 'too precise' } } };
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify(body), { status: 400 }));
-    const err = await failure(requestForTest('/expenses', { method: 'POST', body: '{}' }, fetchImpl));
-    expect(err).toBeInstanceOf(ApiError);
-    expect(err.status).toBe(400);
+    const err = await failure(request('/expenses', { method: 'POST', body: '{}' }, fetchImpl));
+    expect(err.kind).toBe('validation');
     expect(err.fields).toEqual({ amount: 'too precise' });
+    expect(describeError(err, ru)).toBe(ru.apiErrors.validation);
+    expect(describeError(err, en)).toBe(en.apiErrors.validation);
     expect(fetchImpl).toHaveBeenCalledWith('/api/expenses', expect.objectContaining({ headers: { 'Content-Type': 'application/json' } }));
   });
 
-  it('reports network failures and non-JSON errors clearly', async () => {
-    const down = await failure(requestForTest('/config', {}, vi.fn(async () => Promise.reject(new TypeError('fetch failed')))));
-    expect(down).toBeInstanceOf(ApiError);
-    expect(down.status).toBe(0);
-    const proxy = await failure(requestForTest('/config', {}, vi.fn(async () => new Response('<html>Bad Gateway</html>', { status: 502 }))));
-    expect(proxy.message).toContain('502');
+  it('describes network, proxy, storage and unknown failures in both languages', async () => {
+    const down = await failure(request('/config', {}, vi.fn(async () => Promise.reject(new TypeError('fetch failed')))));
+    expect(down.kind).toBe('network');
+    expect(describeError(down, en)).toBe(en.apiErrors.network);
+
+    const proxy = await failure(request('/config', {}, vi.fn(async () => new Response('<html>Bad Gateway</html>', { status: 502 }))));
+    expect(proxy.kind).toBe('proxy');
+    expect(describeError(proxy, ru)).toContain('502');
+    expect(describeError(proxy, en)).toContain('502');
+
+    const storage = await failure(
+      request('/expenses', {}, vi.fn(async () => new Response(JSON.stringify({ error: { code: 'unavailable', message: 'x' } }), { status: 503 }))),
+    );
+    expect(storage.kind).toBe('unavailable');
+
+    const teapot = await failure(request('/x', {}, vi.fn(async () => new Response('{}', { status: 418 }))));
+    expect(describeError(teapot, en)).toBe(en.apiErrors.unknown(418));
+    expect(describeError(new Error('boom'), ru)).toBe(ru.apiErrors.unexpected);
   });
 
   it('returns undefined for 204', async () => {
-    await expect(requestForTest('/expenses/1', { method: 'DELETE' }, vi.fn(async () => new Response(null, { status: 204 })))).resolves.toBeUndefined();
+    await expect(request('/expenses/1', { method: 'DELETE' }, vi.fn(async () => new Response(null, { status: 204 })))).resolves.toBeUndefined();
   });
 });
 
@@ -108,7 +138,8 @@ async function failure(p: Promise<unknown>): Promise<ApiError> {
   try {
     await p;
   } catch (e) {
-    return e as ApiError;
+    if (e instanceof ApiError) return e;
+    throw e;
   }
   throw new Error('expected the request to fail');
 }

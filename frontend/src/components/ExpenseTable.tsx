@@ -1,5 +1,4 @@
-import { humanDate } from '../dates';
-import { CATEGORY_LABELS, formatMoney } from '../format';
+import { useI18n } from '../i18n/I18nProvider';
 import type { Expense } from '../types';
 
 interface Props {
@@ -11,36 +10,38 @@ interface Props {
 }
 
 export function ExpenseTable({ items, currency, stale, onEdit, onDelete }: Props) {
+  const { m, money, date } = useI18n();
+  const t = m.table;
   return (
     <table className={stale ? 'expenses stale' : 'expenses'}>
       <thead>
         <tr>
-          <th>Дата</th>
-          <th>Член семьи</th>
-          <th>Категория</th>
-          <th className="num">Сумма</th>
-          <th>Комментарий</th>
-          <th aria-label="Действия" />
+          <th>{t.date}</th>
+          <th>{t.member}</th>
+          <th>{t.category}</th>
+          <th className="num">{t.amount}</th>
+          <th>{t.comment}</th>
+          <th aria-label={t.actions} />
         </tr>
       </thead>
       <tbody>
         {items.map((e) => (
           <tr key={e.id}>
-            <td data-label="Дата">{humanDate(e.spent_at)}</td>
-            <td data-label="Член семьи">{e.member_name || e.user_id}</td>
-            <td data-label="Категория">{CATEGORY_LABELS[e.category] ?? e.category}</td>
-            <td data-label="Сумма" className="num">
-              {formatMoney(e.amount, currency)}
+            <td data-label={t.date}>{date(e.spent_at)}</td>
+            <td data-label={t.member}>{e.member_name || e.user_id}</td>
+            <td data-label={t.category}>{m.categories[e.category] ?? e.category}</td>
+            <td data-label={t.amount} className="num">
+              {money(e.amount, currency)}
             </td>
-            <td data-label="Комментарий" className="comment">
+            <td data-label={t.comment} className="comment">
               {e.comment ?? '—'}
             </td>
             <td className="row-actions">
               <button type="button" className="btn small" onClick={() => onEdit(e)}>
-                Изменить
+                {t.edit}
               </button>
               <button type="button" className="btn small danger" onClick={() => onDelete(e)}>
-                Удалить
+                {t.delete}
               </button>
             </td>
           </tr>

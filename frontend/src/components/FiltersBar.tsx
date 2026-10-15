@@ -1,5 +1,6 @@
 import { presetRange, type Preset } from '../dates';
-import { CATEGORY_LABELS } from '../format';
+import { useI18n } from '../i18n/I18nProvider';
+import type { Messages } from '../i18n/messages';
 import type { AppConfig, Filters } from '../types';
 
 interface Props {
@@ -8,55 +9,56 @@ interface Props {
   onChange: (f: Filters) => void;
 }
 
-const PRESETS: [Preset, string][] = [
-  ['this_week', 'Эта неделя'],
-  ['this_month', 'Этот месяц'],
-  ['last_month', 'Прошлый месяц'],
-  ['all', 'Всё время'],
+const PRESETS: [Preset, keyof Messages['filters']][] = [
+  ['this_week', 'thisWeek'],
+  ['this_month', 'thisMonth'],
+  ['last_month', 'lastMonth'],
+  ['all', 'allTime'],
 ];
 
-export function rangeError(f: Filters): string | null {
-  return f.from && f.to && f.to < f.from ? 'Дата «по» не может быть раньше даты «с».' : null;
+/** True when the inclusive range is reversed; the list is not loaded then. */
+export function hasRangeError(f: Filters): boolean {
+  return Boolean(f.from && f.to && f.to < f.from);
 }
 
 export function FiltersBar({ config, filters, onChange }: Props) {
+  const { m } = useI18n();
   const set = (patch: Partial<Filters>) => onChange({ ...filters, ...patch });
-  const error = rangeError(filters);
 
   return (
     <form className="filters" autoComplete="off" onSubmit={(e) => e.preventDefault()}>
       <label>
-        Член семьи
+        {m.filters.member}
         <select value={filters.userId} onChange={(e) => set({ userId: e.target.value })}>
-          <option value="">Все</option>
-          {config.members.map((m) => (
-            <option key={m.id} value={String(m.id)}>
-              {m.name}
+          <option value="">{m.filters.all}</option>
+          {config.members.map((mem) => (
+            <option key={mem.id} value={String(mem.id)}>
+              {mem.name}
             </option>
           ))}
         </select>
       </label>
       <label>
-        Категория
+        {m.filters.category}
         <select value={filters.category} onChange={(e) => set({ category: e.target.value })}>
-          <option value="">Все</option>
+          <option value="">{m.filters.all}</option>
           {config.categories.map((c) => (
             <option key={c} value={c}>
-              {CATEGORY_LABELS[c]}
+              {m.categories[c]}
             </option>
           ))}
         </select>
       </label>
       <label>
-        С даты
+        {m.filters.from}
         <input type="date" value={filters.from} onChange={(e) => set({ from: e.target.value })} />
       </label>
       <label>
-        По дату (включительно)
+        {m.filters.to}
         <input type="date" value={filters.to} onChange={(e) => set({ to: e.target.value })} />
       </label>
       <div className="presets">
-        {PRESETS.map(([p, label]) => (
+        {PRESETS.map(([p, key]) => (
           <button
             key={p}
             type="button"
@@ -66,11 +68,11 @@ export function FiltersBar({ config, filters, onChange }: Props) {
               set({ from, to });
             }}
           >
-            {label}
+            {m.filters[key]}
           </button>
         ))}
       </div>
-      {error && <p className="field-error filters-error">{error}</p>}
+      {hasRangeError(filters) && <p className="field-error filters-error">{m.filters.rangeError}</p>}
     </form>
   );
 }

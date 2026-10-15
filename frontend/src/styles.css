@@ -102,3 +102,14 @@ dialog::backdrop { background: rgba(0, 0, 0, .45); }
   .filters { grid-template-columns: 1fr; }
   .topbar h1 { font-size: 1.05rem; }
 }
+
+.topbar-actions { display: flex; align-items: center; gap: 10px; }
+.lang-switch { display: inline-flex; }
+.lang-switch .btn { border-radius: 0; }
+.lang-switch .btn:first-child { border-radius: 8px 0 0 8px; }
+.lang-switch .btn:last-child { border-radius: 0 8px 8px 0; }
+.lang-switch .btn + .btn { margin-left: -1px; }
+.lang-switch .btn.active { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+@media (max-width: 420px) {
+  .topbar { flex-wrap: wrap; }
+}

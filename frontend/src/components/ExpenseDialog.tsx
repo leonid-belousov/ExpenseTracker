@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import { ApiError } from '../api';
-import { CATEGORY_LABELS, validateDraft, type ExpenseDraft } from '../format';
-import type { AppConfig, Expense, ExpenseInput, FieldErrors } from '../types';
+import { ApiError, describeError } from '../api';
+import { validateDraft, type ExpenseDraft, type ValidationErrors } from '../format';
+import { useI18n } from '../i18n/I18nProvider';
+import type { AppConfig, Expense, ExpenseField, ExpenseInput, FieldErrors } from '../types';
 
 interface Props {
   config: AppConfig;
@@ -25,10 +26,14 @@ function initialDraft(expense: Expense | null, defaultMemberId: string, today: s
 }
 
 export function ExpenseDialog({ config, expense, defaultMemberId, onSave, onClose }: Props) {
+  const { m } = useI18n();
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [draft, setDraft] = useState(() => initialDraft(expense, defaultMemberId, config.today));
-  const [errors, setErrors] = useState<FieldErrors>({});
-  const [formError, setFormError] = useState<string | null>(null);
+  // Errors are kept language-neutral (codes, field names, the error object)
+  // and translated at render time, so switching language re-renders them.
+  const [clientErrors, setClientErrors] = useState<ValidationErrors>({});
+  const [serverFields, setServerFields] = useState<FieldErrors>({});
+  const [saveError, setSaveError] = useState<unknown>(null);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -40,45 +45,53 @@ export function ExpenseDialog({ config, expense, defaultMemberId, onSave, onClos
 
   async function submit(ev: FormEvent) {
     ev.preventDefault();
-    setFormError(null);
-    const { input, errors: clientErrors } = validateDraft(draft, config.today);
-    setErrors(clientErrors);
+    setSaveError(null);
+    setServerFields({});
+    const { input, errors } = validateDraft(draft, config.today);
+    setClientErrors(errors);
     if (!input) return;
     setSaving(true);
     try {
       await onSave(input);
     } catch (e) {
-      if (e instanceof ApiError) {
-        setErrors(e.fields);
-        setFormError(e.status === 404 ? 'Трата уже удалена. Обновите список.' : 'Не сохранено: ' + e.message);
-      } else {
-        setFormError('Не сохранено: непредвиденная ошибка.');
-      }
+      setServerFields(e instanceof ApiError ? e.fields : {});
+      setSaveError(e);
     } finally {
       setSaving(false);
     }
   }
 
-  const fieldError = (k: keyof FieldErrors) => (errors[k] ? <span className="field-error">{errors[k]}</span> : null);
+  function fieldError(field: ExpenseField) {
+    const code = clientErrors[field];
+    const text = code ? m.validation[code] : serverFields[field] ? m.serverField[field] : null;
+    return text ? <span className="field-error">{text}</span> : null;
+  }
+
+  const saveErrorText =
+    saveError === null
+      ? null
+      : saveError instanceof ApiError && saveError.kind === 'notFound'
+        ? m.dialog.alreadyDeleted
+        : m.dialog.notSaved(describeError(saveError, m));
 
   return (
     <dialog ref={dialogRef} onCancel={onClose} onClose={onClose}>
       <form className="edit-form" noValidate onSubmit={submit}>
-        <h2>{expense ? 'Изменить трату' : 'Новая трата'}</h2>
+        <h2>{expense ? m.dialog.editTitle : m.dialog.createTitle}</h2>
         <label>
-          Член семьи
+          {m.dialog.member}
           <select value={draft.userId} onChange={(e) => set({ userId: e.target.value })}>
-            <option value="">— выберите —</option>
-            {config.members.map((m) => (
-              <option key={m.id} value={String(m.id)}>
-                {m.name}
+            <option value="">{m.dialog.choose}</option>
+            {config.members.map((mem) => (
+              <option key={mem.id} value={String(mem.id)}>
+                {mem.name}
               </option>
             ))}
           </select>
           {fieldError('user_id')}
         </label>
         <label>
-          Сумма, {config.currency}
+          {m.dialog.amount(config.currency)}
           <input
             inputMode="decimal"
             placeholder="350.00"
@@ -89,38 +102,38 @@ export function ExpenseDialog({ config, expense, defaultMemberId, onSave, onClos
           {fieldError('amount')}
         </label>
         <label>
-          Категория
+          {m.dialog.category}
           <select value={draft.category} onChange={(e) => set({ category: e.target.value })}>
-            <option value="">— выберите —</option>
+            <option value="">{m.dialog.choose}</option>
             {config.categories.map((c) => (
               <option key={c} value={c}>
-                {CATEGORY_LABELS[c]}
+                {m.categories[c]}
               </option>
             ))}
           </select>
           {fieldError('category')}
         </label>
         <label>
-          Дата траты
+          {m.dialog.date}
           <input type="date" max={config.today} value={draft.spentAt} onChange={(e) => set({ spentAt: e.target.value })} />
           {fieldError('spent_at')}
         </label>
         <label>
-          Комментарий
+          {m.dialog.comment}
           <input maxLength={500} value={draft.comment} onChange={(e) => set({ comment: e.target.value })} />
           {fieldError('comment')}
         </label>
-        {formError && (
+        {saveErrorText && (
           <p className="banner" role="alert">
-            {formError}
+            {saveErrorText}
           </p>
         )}
         <div className="actions">
           <button type="button" className="btn" onClick={onClose} disabled={saving}>
-            Отмена
+            {m.dialog.cancel}
           </button>
           <button type="submit" className="btn primary" disabled={saving}>
-            {saving ? 'Сохранение…' : 'Сохранить'}
+            {saving ? m.dialog.saving : m.dialog.save}
           </button>
         </div>
       </form>

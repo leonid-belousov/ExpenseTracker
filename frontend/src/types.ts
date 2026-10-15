@@ -61,4 +61,7 @@ export interface Filters {
   to: string;
 }
 
-export type FieldErrors = Partial<Record<keyof ExpenseInput, string>>;
+export type ExpenseField = keyof ExpenseInput;
+
+/** Raw per-field messages returned by the API (English). */
+export type FieldErrors = Partial<Record<ExpenseField, string>>;
